@@ -45,16 +45,73 @@ step once cached, and is a useful fallback when Ollama is not running.
 - Windows 10/11, PowerShell 7+ (`pwsh`)
 - Docker Desktop (Linux containers)
 - NVIDIA GPU recommended
-- For the default provider: [Ollama](https://ollama.com) with a vision model pulled
-- For the `florence` provider: nothing extra; `caption.ps1` starts the container
+- A captioning backend — either of:
+  - **Ollama** (default) with any vision-capable model installed
+  - **Florence-2**, which needs nothing extra: `caption.ps1` starts the container
 
-## Quickstart
+## Choosing a captioning backend
 
-Pull a vision-capable model (one time):
+Two providers ship with the tool. Neither is required in advance — pick whichever
+suits what you already have.
+
+### Ollama (default)
+
+Any model that reports Ollama's `vision` capability works. You do **not** need a
+specific one. If you already have a vision model, the tool finds and uses it:
 
 ```powershell
-ollama pull qwen3.5
+./caption.ps1 -ImageDir .\photos\mikey -Concept mikey
+#   No -Model given; looking for an installed vision model ...
+#   Using model minicpm-v:latest.
 ```
+
+To see which of your models can caption images:
+
+```powershell
+ollama list
+# then, for any model:
+(Invoke-RestMethod -Method Post -Uri http://localhost:11434/api/show `
+    -Body '{"model":"<name>"}').capabilities
+# a model usable here reports: vision
+```
+
+Pin a specific model when you want one:
+
+```powershell
+./caption.ps1 -ImageDir .\photos\mikey -Concept mikey -Model llava:13b
+```
+
+Naming a text-only model is refused up front, with your vision-capable models
+listed, rather than silently captioning nothing.
+
+If you have no vision model yet, any of these work — `qwen3.5` is what the
+project was developed against:
+
+```powershell
+ollama pull qwen3.5            # ~6GB, strong detail, follows instructions well
+ollama pull llava              # ~5GB, widely available
+ollama pull moondream          # ~1.7GB, smallest, fastest
+```
+
+Auto-selection order is `qwen3.5`, `qwen3-vl`, `qwen2.5vl`, `llama3.2-vision`,
+`minicpm-v`, `moondream`, `llava`, then any other vision model installed.
+Override it with `$env:LORA_CAPTION_MODELS` (comma-separated).
+
+### Florence-2
+
+A self-contained container, useful when you would rather not run Ollama or need
+a fully offline fallback:
+
+```powershell
+./caption.ps1 -ImageDir .\photos\mikey -Concept mikey -Provider florence
+```
+
+Florence-2 cannot take instructions, so its captions are normalised afterwards
+by rule rather than shaped by a prompt. Expect lower quality: it describes fixed
+identity traits regardless, and hallucinates detail more readily. See
+[Why the provider interface](#why-the-provider-interface).
+
+## Quickstart
 
 Caption a folder of photos. This builds `./datasets/mikey` and leaves the source
 folder untouched:
@@ -100,8 +157,8 @@ Written into the dataset folder, never into the source folder:
 # Offline fallback
 ./caption.ps1 -ImageDir .\data -Concept mikey -Provider florence
 
-# A different Ollama model
-./caption.ps1 -ImageDir .\data -Concept mikey -Model qwen3.5
+# Pin a specific model instead of auto-selecting one
+./caption.ps1 -ImageDir .\data -Concept mikey -Model llava:13b
 
 # Extra guidance, appended to the prompt
 ./caption.ps1 -ImageDir .\data -Concept mikey -Instruction "note the lighting direction"
@@ -187,8 +244,14 @@ test in `tests/Captioners.Tests.ps1`:
 **`Cannot reach Ollama`** - start it with `docker start ollama`, or run Ollama for
 Windows. Confirm with `curl http://localhost:11434/api/tags`.
 
-**`Model 'x' not found in Ollama`** - `ollama pull <model>`. The error lists what is
-available.
+**`Model 'x' is not installed in Ollama`** - `ollama pull <model>`. The error lists
+what you do have.
+
+**`Model 'x' cannot accept images`** - that model is text-only. The error lists your
+vision-capable models; pass one with `-Model`, or omit `-Model` to auto-select.
+
+**`No vision-capable model is installed`** - pull one (`ollama pull qwen3.5`,
+`llava` or `moondream`), or use `-Provider florence`, which needs no model pull.
 
 **Ollama is running but reports no models** - a host install and a container install
 keep separate model stores. Check which one owns port 11434.

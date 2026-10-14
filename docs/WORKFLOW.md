@@ -9,12 +9,15 @@ It is used verbatim in every caption and is what you prompt with later.
 
 ## 1) Make sure a captioning provider is up
 
-Default provider (Ollama):
+Default provider (Ollama). Any model reporting the `vision` capability works;
+the tool auto-selects one, so this is only needed if you have none:
 
 ```powershell
 docker start ollama          # or run Ollama for Windows
-ollama pull qwen3.5          # one time
 curl http://localhost:11434/api/tags
+
+# Only if you have no vision model yet:
+ollama pull qwen3.5          # or llava, moondream, minicpm-v ...
 ```
 
 Fallback provider (Florence-2) - `caption.ps1` starts it automatically, or:
@@ -35,7 +38,8 @@ Useful switches:
 |---|---|
 | `-Tagify` | Comma-separated tags instead of prose |
 | `-ConceptType` | `character` (default), `clothing`, `style`, `object` |
-| `-Provider florence` | Use the offline fallback |
+| `-Provider florence` | Use the offline fallback, no model pull needed |
+| `-Model` | Pin a specific Ollama model instead of auto-selecting |
 | `-Instruction "..."` | Extra guidance appended to the prompt |
 | `-Overwrite` | Re-caption even if `captions.json` exists |
 | `-OutputDir` | Where the dataset is built (default `./datasets/<concept>`) |

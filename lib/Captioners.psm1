@@ -377,6 +377,87 @@ function Build-CaptionPrompt {
 }
 
 
+function Get-OllamaModelCapability {
+    <#
+    .SYNOPSIS
+        Returns the capability list Ollama reports for a model.
+
+    .DESCRIPTION
+        Ollama's /api/show returns a 'capabilities' array such as
+        @('completion', 'vision', 'tools', 'thinking'). This is the
+        authoritative way to tell whether a model can accept images; guessing
+        from the model name is unreliable because vision and text variants are
+        often named alike.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Model,
+        [string]$Endpoint = 'http://localhost:11434',
+        [int]$TimeoutSec = 30
+    )
+
+    try {
+        $body = @{ model = $Model } | ConvertTo-Json -Compress
+        $info = Invoke-RestMethod -Method Post -Uri "$Endpoint/api/show" `
+            -ContentType 'application/json' -Body $body -TimeoutSec $TimeoutSec
+    }
+    catch {
+        return @()
+    }
+
+    $prop = $info.PSObject.Properties['capabilities']
+    if (-not $prop -or -not $prop.Value) { return @() }
+    return @($prop.Value)
+}
+
+
+function Get-OllamaVisionModel {
+    <#
+    .SYNOPSIS
+        Finds an installed Ollama model that can accept images.
+
+    .DESCRIPTION
+        Returns the preferred model when it is installed and vision-capable,
+        otherwise the first installed model that reports the 'vision'
+        capability. Returns $null when the host has no vision model.
+
+        This exists so the tool works with whatever vision model a user already
+        has, instead of insisting on one specific name.
+
+    .OUTPUTS
+        The model name, or $null.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Endpoint = 'http://localhost:11434',
+        [string[]]$Preferred = @(),
+        [int]$TimeoutSec = 30
+    )
+
+    $tags = Invoke-RestMethod -Method Get -Uri "$Endpoint/api/tags" -TimeoutSec $TimeoutSec
+    $installed = @($tags.models | ForEach-Object { $_.name })
+    if ($installed.Count -eq 0) { return $null }
+
+    # Try the preferred names first so a known-good default wins, and so the
+    # common case costs one /api/show call rather than one per installed model.
+    foreach ($want in $Preferred) {
+        if (-not $want) { continue }
+        $match = $installed | Where-Object { $_ -eq $want -or $_ -like "$want`:*" } | Select-Object -First 1
+        if ($match) {
+            $caps = Get-OllamaModelCapability -Model $match -Endpoint $Endpoint -TimeoutSec $TimeoutSec
+            if ($caps -contains 'vision') { return $match }
+        }
+    }
+
+    foreach ($candidate in $installed) {
+        $caps = Get-OllamaModelCapability -Model $candidate -Endpoint $Endpoint -TimeoutSec $TimeoutSec
+        if ($caps -contains 'vision') { return $candidate }
+    }
+
+    return $null
+}
+
+
 function Invoke-OllamaCaption {
     <#
     .SYNOPSIS
@@ -515,6 +596,8 @@ function Get-ImageCaption {
 
 
 Export-ModuleMember -Function @(
+    'Get-OllamaModelCapability'
+    'Get-OllamaVisionModel'
     'Remove-CaptionPreamble'
     'Convert-ToTags'
     'Set-CaptionSubject'

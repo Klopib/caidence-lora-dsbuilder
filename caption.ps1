@@ -83,8 +83,9 @@ param(
     [switch]$Tagify,
     [switch]$Overwrite,
 
-    # Ollama provider
-    [string]$Model = 'qwen3.5',
+    # Ollama provider. Leave -Model empty to auto-select whichever installed
+    # model reports the 'vision' capability, preferring $PreferredModels.
+    [string]$Model = '',
     [string]$OllamaEndpoint = 'http://localhost:11434',
 
     # Florence provider
@@ -101,6 +102,16 @@ Set-StrictMode -Version Latest
 Import-Module (Join-Path $PSScriptRoot 'lib/Captioners.psm1') -Force
 
 $ImageExtensions = @('.png', '.jpg', '.jpeg', '.webp', '.bmp')
+
+# Tried in order when -Model is not given. Any installed model reporting the
+# 'vision' capability works; these are just sensible first choices. Override
+# the order with $env:LORA_CAPTION_MODELS (comma-separated).
+$PreferredModels = if ($env:LORA_CAPTION_MODELS) {
+    @($env:LORA_CAPTION_MODELS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+else {
+    @('qwen3.5', 'qwen3-vl', 'qwen2.5vl', 'llama3.2-vision', 'minicpm-v', 'moondream', 'llava')
+}
 
 
 function Wait-ForEndpoint {
@@ -133,23 +144,55 @@ function Initialize-OllamaProvider {
         $tags = Invoke-RestMethod -Method Get -Uri "$OllamaEndpoint/api/tags" -TimeoutSec 10
     }
     catch {
-        throw "Cannot reach Ollama at $OllamaEndpoint. Start it with: docker start ollama"
+        throw ("Cannot reach Ollama at $OllamaEndpoint.`n" +
+            "  Start it with: docker start ollama`n" +
+            "  Or run Ollama for Windows, then check: curl $OllamaEndpoint/api/tags")
     }
 
     $available = @($tags.models | ForEach-Object { $_.name })
     if ($available.Count -eq 0) {
-        throw "Ollama is running but has no models. Pull one with: ollama pull $Model"
+        throw ("Ollama is running but has no models installed.`n" +
+            "  Pull a vision model, for example: ollama pull $($PreferredModels[0])")
     }
 
-    # Ollama tags are "name:tag"; accept a bare name as matching its default tag.
-    $matched = $available | Where-Object { $_ -eq $Model -or $_ -like "$Model`:*" } | Select-Object -First 1
-    if (-not $matched) {
-        throw ("Model '$Model' not found in Ollama. Available: {0}" -f ($available -join ', '))
+    if ($Model) {
+        # An explicit choice is honoured, but verified: a text-only model fails
+        # confusingly later, having ignored the image entirely.
+        $resolved = $available | Where-Object { $_ -eq $Model -or $_ -like "$Model`:*" } | Select-Object -First 1
+        if (-not $resolved) {
+            throw ("Model '$Model' is not installed in Ollama.`n" +
+                "  Installed: $($available -join ', ')`n" +
+                "  Pull it with: ollama pull $Model")
+        }
+
+        $caps = Get-OllamaModelCapability -Model $resolved -Endpoint $OllamaEndpoint -TimeoutSec 30
+        if ($caps -and ($caps -notcontains 'vision')) {
+            $visionModels = @(
+                $available | Where-Object {
+                    (Get-OllamaModelCapability -Model $_ -Endpoint $OllamaEndpoint -TimeoutSec 30) -contains 'vision'
+                }
+            )
+            $hint = if ($visionModels) { "  Vision-capable models you have: $($visionModels -join ', ')" }
+            else { "  None of your installed models support vision. Try: ollama pull $($PreferredModels[0])" }
+
+            throw ("Model '$resolved' cannot accept images (capabilities: $($caps -join ', ')).`n$hint")
+        }
+    }
+    else {
+        Write-Host '  No -Model given; looking for an installed vision model ...' -ForegroundColor DarkGray
+        $resolved = Get-OllamaVisionModel -Endpoint $OllamaEndpoint -Preferred $PreferredModels -TimeoutSec 30
+
+        if (-not $resolved) {
+            throw ("No vision-capable model is installed in Ollama.`n" +
+                "  Installed: $($available -join ', ')`n" +
+                "  Pull one, for example: ollama pull $($PreferredModels[0])`n" +
+                "  Or caption without Ollama: -Provider florence")
+        }
     }
 
-    Write-Host "  Using model $matched." -ForegroundColor Green
+    Write-Host "  Using model $resolved." -ForegroundColor Green
     return @{
-        Model      = $Model
+        Model      = $resolved
         Endpoint   = $OllamaEndpoint
         TimeoutSec = $TimeoutSec
     }
@@ -284,9 +327,19 @@ else {
 
 # --- Prepare the provider ---------------------------------------------------
 
-$providerOptions = switch ($Provider) {
-    'ollama' { Initialize-OllamaProvider }
-    'florence' { Initialize-FlorenceProvider }
+try {
+    $providerOptions = switch ($Provider) {
+        'ollama' { Initialize-OllamaProvider }
+        'florence' { Initialize-FlorenceProvider }
+    }
+}
+catch {
+    # Setup problems are the ones users hit most (wrong model, service down),
+    # so they get a readable message instead of a PowerShell stack trace.
+    Write-Host ''
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host ''
+    exit 1
 }
 
 Write-Host ''

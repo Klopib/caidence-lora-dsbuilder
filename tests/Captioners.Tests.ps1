@@ -328,6 +328,83 @@ Describe 'Get-ImageCaption' {
     }
 }
 
+Describe 'Get-OllamaVisionModel' {
+
+    It 'prefers a listed model when it is installed and vision-capable' {
+        Mock -ModuleName Captioners Invoke-RestMethod {
+            @{ models = @(@{ name = 'llava:7b' }, @{ name = 'qwen3.5:latest' }) }
+        }
+        Mock -ModuleName Captioners Get-OllamaModelCapability {
+            if ($Model -like 'qwen3.5*') { @('completion', 'vision') } else { @('completion', 'vision') }
+        }
+
+        Get-OllamaVisionModel -Preferred @('qwen3.5') | Should -Be 'qwen3.5:latest'
+    }
+
+    It 'falls back to any installed vision model when no preference matches' {
+        # A user who already has a vision model should not be forced to pull
+        # a second one just because it is not the tool's favourite.
+        Mock -ModuleName Captioners Invoke-RestMethod {
+            @{ models = @(@{ name = 'qwen2.5-coder:14b' }, @{ name = 'minicpm-v:latest' }) }
+        }
+        Mock -ModuleName Captioners Get-OllamaModelCapability {
+            if ($Model -like 'minicpm*') { @('completion', 'vision') } else { @('completion', 'tools') }
+        }
+
+        Get-OllamaVisionModel -Preferred @('qwen3.5') | Should -Be 'minicpm-v:latest'
+    }
+
+    It 'skips a preferred model that is installed but text-only' {
+        Mock -ModuleName Captioners Invoke-RestMethod {
+            @{ models = @(@{ name = 'qwen3.5:latest' }, @{ name = 'llava:7b' }) }
+        }
+        Mock -ModuleName Captioners Get-OllamaModelCapability {
+            if ($Model -like 'llava*') { @('completion', 'vision') } else { @('completion') }
+        }
+
+        Get-OllamaVisionModel -Preferred @('qwen3.5') | Should -Be 'llava:7b'
+    }
+
+    It 'returns null when nothing installed supports vision' {
+        Mock -ModuleName Captioners Invoke-RestMethod {
+            @{ models = @(@{ name = 'qwen2.5-coder:14b' }) }
+        }
+        Mock -ModuleName Captioners Get-OllamaModelCapability { @('completion', 'tools') }
+
+        Get-OllamaVisionModel -Preferred @('qwen3.5') | Should -BeNullOrEmpty
+    }
+
+    It 'returns null when no models are installed at all' {
+        Mock -ModuleName Captioners Invoke-RestMethod { @{ models = @() } }
+
+        Get-OllamaVisionModel | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-OllamaModelCapability' {
+
+    It 'returns the capability list Ollama reports' {
+        Mock -ModuleName Captioners Invoke-RestMethod {
+            [pscustomobject]@{ capabilities = @('completion', 'vision', 'thinking') }
+        }
+
+        $caps = Get-OllamaModelCapability -Model 'qwen3.5'
+        $caps | Should -Contain 'vision'
+    }
+
+    It 'returns an empty list when the model is unknown to Ollama' {
+        Mock -ModuleName Captioners Invoke-RestMethod { throw 'model not found' }
+
+        Get-OllamaModelCapability -Model 'nope' | Should -BeNullOrEmpty
+    }
+
+    It 'returns an empty list when the response carries no capabilities field' {
+        Mock -ModuleName Captioners Invoke-RestMethod { [pscustomobject]@{ details = @{} } }
+
+        Get-OllamaModelCapability -Model 'old-model' | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Build-CaptionPrompt' {
 
     It 'names the trigger word in the prompt' {
