@@ -193,6 +193,47 @@ function Test-FlorenceBackend {
 }
 
 
+function Invoke-CaptionerSetup {
+    <#
+    .SYNOPSIS
+        Runs setup-captioner.ps1 and reports the endpoint it ended up on.
+    .DESCRIPTION
+        The setup script may settle on a port other than the default when the
+        usual one is taken by something that is not Ollama, so the endpoint is
+        rediscovered afterwards rather than assumed.
+    .OUTPUTS
+        The endpoint URL, or $null when setup did not produce a usable backend.
+    #>
+    param(
+        [string]$ScriptPath,
+        [string]$PreferredEndpoint
+    )
+
+    if (-not (Test-Path $ScriptPath)) {
+        throw "setup-captioner.ps1 not found at $ScriptPath"
+    }
+
+    & pwsh -NoProfile -File $ScriptPath
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  Captioner setup did not complete." -ForegroundColor Yellow
+        return $null
+    }
+
+    if ((Test-OllamaBackend -Endpoint $PreferredEndpoint).Ok) { return $PreferredEndpoint }
+
+    foreach ($p in 11434..11440) {
+        $candidate = "http://localhost:$p"
+        if ($candidate -eq $PreferredEndpoint) { continue }
+        if ((Test-OllamaBackend -Endpoint $candidate).Ok) {
+            Write-Host "  Using captioner at $candidate" -ForegroundColor Cyan
+            return $candidate
+        }
+    }
+
+    return $null
+}
+
+
 function Read-IntValue {
     param(
         [string]$Message,
@@ -627,25 +668,133 @@ $totalSteps = $imageCount * $TrainingRate
 Write-Host "  [ok] Training rate set to: $TrainingRate" -ForegroundColor Green
 Write-Host "  [ok] Total training steps per epoch: $totalSteps" -ForegroundColor Green
 
-# --- Step 6b: Captioning options --------------------------------------------
+# --- Step 6b: Captioning backend --------------------------------------------
 
-# Defaults suit most runs, so this is one question deep unless the user opts in.
+# Detection first, then a question about what was found. Asking someone to
+# choose a backend before telling them what is installed makes them guess.
 Write-Host ""
-Write-Host "Captioning settings" -ForegroundColor White
-Write-Host "  Provider:     $Provider" -ForegroundColor DarkGray
-Write-Host "  Model:        $(if ($Model) { $Model } else { 'auto-select an installed vision model' })" -ForegroundColor DarkGray
-Write-Host "  Style:        $(if ($Tagify) { 'comma-separated tags' } else { 'prose clauses' })" -ForegroundColor DarkGray
-Write-Host "  Guidance:     $(if ($Instruction) { $Instruction } else { 'none' })" -ForegroundColor DarkGray
-Write-Host ""
+Write-Host "Captioning" -ForegroundColor White
+Write-Host "  Checking what is available ..." -ForegroundColor DarkGray
 
-if (Read-YesNo "Change captioning settings?" -Default $false) {
+$backendReady = $false
+
+while (-not $backendReady) {
+
+    $ollama = Test-OllamaBackend -Endpoint $OllamaEndpoint
+
+    if ($ollama.Ok -and $Provider -eq 'ollama') {
+        Write-Host ""
+        Write-Host "  Found Ollama at $OllamaEndpoint" -ForegroundColor Green
+        Write-Host "    Vision-capable models: $($ollama.Models -join ', ')" -ForegroundColor DarkGray
+        Write-Host ""
+
+        if (Read-YesNo "Use Ollama for captioning?" -Default $true) {
+            $Provider = 'ollama'
+
+            if ($Model -and ($ollama.Models -notcontains $Model)) {
+                Write-Host "  '$Model' cannot accept images; choose from the list below." -ForegroundColor Yellow
+                $Model = ''
+            }
+
+            if (-not $Model -and -not $script:AcceptDefaults -and $ollama.Models.Count -gt 1) {
+                Write-Host ""
+                Write-Host "Which model?" -ForegroundColor White
+                Write-Host "  1. Auto-select (recommended)" -ForegroundColor DarkGray
+                for ($i = 0; $i -lt $ollama.Models.Count; $i++) {
+                    Write-Host "  $($i + 2). $($ollama.Models[$i])" -ForegroundColor DarkGray
+                }
+                Write-Host ""
+                $pick = Read-IntValue "Choice (1-$($ollama.Models.Count + 1))" -Min 1 -Max ($ollama.Models.Count + 1) -Default 1
+                $Model = if ($pick -eq 1) { '' } else { $ollama.Models[$pick - 2] }
+            }
+
+            $backendReady = $true
+            continue
+        }
+
+        # Declined the Ollama that was found; fall through to the menu.
+        Write-Host ""
+    }
+    elseif ($Provider -eq 'ollama') {
+        Write-Host ""
+        # Reason already names the endpoint and carries its own indent.
+        Write-Host "  $($ollama.Reason)" -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    if ($script:AcceptDefaults) {
+        throw "No working captioning backend. Resolve the above and re-run."
+    }
+
+    Write-Host "How would you like to caption?" -ForegroundColor White
+    Write-Host "  1. Set one up here   downloads a vision model and runs it, needs only Docker" -ForegroundColor DarkGray
+    Write-Host "  2. Florence-2        self-contained container, no model pull, lower quality" -ForegroundColor DarkGray
+    Write-Host "  3. Use a different Ollama address" -ForegroundColor DarkGray
+    Write-Host "  4. Retry             after starting Ollama in another window" -ForegroundColor DarkGray
+    Write-Host "  5. Cancel" -ForegroundColor DarkGray
+    Write-Host ""
+
+    switch (Read-IntValue "Choice (1-5)" -Min 1 -Max 5 -Default 1) {
+
+        1 {
+            $resolved = Invoke-CaptionerSetup -ScriptPath (Join-Path $ScriptsDir 'setup-captioner.ps1') `
+                -PreferredEndpoint $OllamaEndpoint
+            $Provider = 'ollama'
+            $Model = ''
+            if ($resolved) { $OllamaEndpoint = $resolved }
+        }
+
+        2 {
+            $florence = Test-FlorenceBackend -Endpoint $FlorenceEndpoint `
+                -StartScript (Join-Path $ScriptsDir 'start.ps1') -MayStart $true
+            if ($florence.Ok) {
+                Write-Host "  [ok] Florence-2 responding at $FlorenceEndpoint" -ForegroundColor Green
+                $Provider = 'florence'
+                $Model = ''
+                $backendReady = $true
+            }
+            else {
+                Write-Host ""
+                Write-Host "  Florence-2 unavailable: $($florence.Reason)" -ForegroundColor Red
+                Write-Host ""
+            }
+        }
+
+        3 {
+            $addr = (Read-Host "Ollama address [$OllamaEndpoint]").Trim()
+            if ($addr) {
+                if ($addr -notmatch '^https?://') { $addr = "http://$addr" }
+                $OllamaEndpoint = $addr
+            }
+            $Provider = 'ollama'
+            $Model = ''
+        }
+
+        4 { $Provider = 'ollama' }
+
+        5 {
+            Write-Host ""
+            Write-Host "Cancelled. No files were created." -ForegroundColor Yellow
+            Write-Host ""
+            pause
+            exit 1
+        }
+    }
 
     Write-Host ""
-    Write-Host "Captioning backend:" -ForegroundColor White
-    Write-Host "  1. Ollama      (default) follows instructions, needs a vision model installed" -ForegroundColor DarkGray
-    Write-Host "  2. Florence-2  self-contained container, no model pull, lower caption quality" -ForegroundColor DarkGray
-    Write-Host ""
-    $Provider = if ((Read-IntValue "Choice (1-2)" -Min 1 -Max 2 -Default 1) -eq 2) { 'florence' } else { 'ollama' }
+}
+
+# --- Step 6c: Caption style and guidance ------------------------------------
+
+Write-Host ""
+Write-Host "Caption settings" -ForegroundColor White
+Write-Host "  Backend:   $Provider$(if ($Provider -eq 'ollama') { " ($OllamaEndpoint)" })" -ForegroundColor DarkGray
+Write-Host "  Model:     $(if ($Model) { $Model } else { 'auto-select' })" -ForegroundColor DarkGray
+Write-Host "  Style:     $(if ($Tagify) { 'comma-separated tags' } else { 'prose clauses' })" -ForegroundColor DarkGray
+Write-Host "  Guidance:  $(if ($Instruction) { $Instruction } else { 'none' })" -ForegroundColor DarkGray
+Write-Host ""
+
+if (-not $script:AcceptDefaults -and (Read-YesNo "Change caption style or guidance?" -Default $false)) {
 
     Write-Host ""
     Write-Host "Caption style:" -ForegroundColor White
@@ -661,115 +810,7 @@ if (Read-YesNo "Change captioning settings?" -Default $false) {
     if ($instructionAnswer) { $Instruction = $instructionAnswer }
 
     Write-Host ""
-    Write-Host "  [ok] Captioning: $Provider / $(if ($Tagify) { 'tags' } else { 'prose' })" -ForegroundColor Green
-}
-
-# --- Step 6c: Confirm the captioning backend actually works -----------------
-
-# Nothing downstream works without a captioner, and images are copied before
-# captioning runs. Confirming the connection here means a dead backend is
-# reported before any work is done, not after.
-Write-Host ""
-Write-Host "Checking the captioning backend..." -ForegroundColor Cyan
-
-while ($true) {
-
-    if ($Provider -eq 'ollama') {
-        $check = Test-OllamaBackend -Endpoint $OllamaEndpoint
-        if ($check.Ok) {
-            Write-Host "  [ok] Ollama reachable at $OllamaEndpoint" -ForegroundColor Green
-            Write-Host "       Vision-capable models: $($check.Models -join ', ')" -ForegroundColor DarkGray
-
-            # Offer the pick-list only once the connection is known good.
-            if ($Model -and ($check.Models -notcontains $Model)) {
-                Write-Host "  '$Model' cannot accept images; choose from the list below." -ForegroundColor Yellow
-                $Model = ''
-            }
-
-            if (-not $Model -and -not $script:AcceptDefaults) {
-                $models = $check.Models
-                Write-Host ""
-                Write-Host "Ollama model:" -ForegroundColor White
-                Write-Host "  1. Auto-select (recommended)" -ForegroundColor DarkGray
-                for ($i = 0; $i -lt $models.Count; $i++) {
-                    Write-Host "  $($i + 2). $($models[$i])" -ForegroundColor DarkGray
-                }
-                Write-Host ""
-                Write-Host "  Only models that can accept images are listed." -ForegroundColor DarkGray
-                Write-Host ""
-                $pick = Read-IntValue "Choice (1-$($models.Count + 1))" -Min 1 -Max ($models.Count + 1) -Default 1
-                $Model = if ($pick -eq 1) { '' } else { $models[$pick - 2] }
-            }
-            break
-        }
-    }
-    else {
-        $check = Test-FlorenceBackend -Endpoint $FlorenceEndpoint `
-            -StartScript (Join-Path $ScriptsDir 'start.ps1') -MayStart (-not $script:AcceptDefaults)
-        if ($check.Ok) {
-            Write-Host "  [ok] Florence-2 responding at $FlorenceEndpoint" -ForegroundColor Green
-            break
-        }
-    }
-
-    Write-Host ""
-    Write-Host "  Captioning backend unavailable:" -ForegroundColor Red
-    Write-Host "    $($check.Reason)" -ForegroundColor Red
-    Write-Host ""
-
-    if ($script:AcceptDefaults) {
-        throw "No working captioning backend. Resolve the above and re-run."
-    }
-
-    $other = if ($Provider -eq 'ollama') { 'Florence-2' } else { 'Ollama' }
-    Write-Host "What now?" -ForegroundColor White
-    Write-Host "  1. Set up a captioner here (downloads a model, needs only Docker)" -ForegroundColor DarkGray
-    Write-Host "  2. Retry (after fixing it in another window)" -ForegroundColor DarkGray
-    Write-Host "  3. Switch to $other" -ForegroundColor DarkGray
-    Write-Host "  4. Cancel" -ForegroundColor DarkGray
-    Write-Host ""
-
-    switch (Read-IntValue "Choice (1-4)" -Min 1 -Max 4 -Default 1) {
-        1 {
-            $setupScript = Join-Path $ScriptsDir 'setup-captioner.ps1'
-            if (-not (Test-Path $setupScript)) {
-                throw "setup-captioner.ps1 not found at $setupScript"
-            }
-
-            & pwsh -NoProfile -File $setupScript
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "  Captioner setup did not complete." -ForegroundColor Yellow
-            }
-            else {
-                # Setup may have settled on a different port when the default
-                # was occupied by something that is not Ollama.
-                $Provider = 'ollama'
-                $Model = ''
-                if (-not (Test-OllamaBackend -Endpoint $OllamaEndpoint).Ok) {
-                    foreach ($p in 11435..11440) {
-                        if ((Test-OllamaBackend -Endpoint "http://localhost:$p").Ok) {
-                            $OllamaEndpoint = "http://localhost:$p"
-                            Write-Host "  Using captioner at $OllamaEndpoint" -ForegroundColor Cyan
-                            break
-                        }
-                    }
-                }
-            }
-        }
-        3 {
-            $Provider = if ($Provider -eq 'ollama') { 'florence' } else { 'ollama' }
-            $Model = ''
-            Write-Host "  Switched to $Provider." -ForegroundColor Cyan
-        }
-        4 {
-            Write-Host ""
-            Write-Host "Cancelled. No files were created." -ForegroundColor Yellow
-            Write-Host ""
-            pause
-            exit 1
-        }
-    }
-    Write-Host ""
+    Write-Host "  [ok] $(if ($Tagify) { 'tags' } else { 'prose' })" -ForegroundColor Green
 }
 
 # --- Step 7: Summary --------------------------------------------------------
