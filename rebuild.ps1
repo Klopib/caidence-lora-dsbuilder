@@ -1,10 +1,18 @@
-# Rebuild florence-2 image
-$ErrorActionPreference = "Stop"
-Set-Location "C:\\AI\\lora-dataset-builder\docker"
-docker compose build --no-cache
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Build failed. Check Docker output above." -ForegroundColor Red
-} else {
-    Write-Host "florence-2 image rebuilt." -ForegroundColor Green
+<#
+.SYNOPSIS
+    Rebuilds the Florence-2 API image from scratch.
+#>
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+Push-Location (Join-Path $PSScriptRoot 'docker')
+try {
+    docker compose build --no-cache
+    if ($LASTEXITCODE -ne 0) { throw "docker compose build failed (exit $LASTEXITCODE)." }
 }
-pause
+finally {
+    Pop-Location
+}
+
+Write-Host 'florence-2 image rebuilt.' -ForegroundColor Green

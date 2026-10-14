@@ -60,8 +60,3 @@ async def caption(file: UploadFile = File(...), task: str = Form(DEFAULT_TASK)) 
         "task": task,
         "result": parsed,
     }
-    return {
-        "model_id": MODEL_ID,
-        "task": task,
-        "result": parsed,
-    }

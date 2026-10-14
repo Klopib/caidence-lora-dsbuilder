@@ -7,9 +7,13 @@ COPY review_ui.py /workspace/review_ui.py
 
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir \
-        gradio==4.44.1 \
+        gradio==4.31.4 \
+        gradio_client==0.16.4 \
         pillow==9.5.0 \
-        huggingface_hub==0.23.4
+        huggingface_hub==0.23.4 \
+    && pip install --no-cache-dir --force-reinstall \
+        fastapi==0.110.2 \
+        starlette==0.37.2
 
 EXPOSE 7861
 

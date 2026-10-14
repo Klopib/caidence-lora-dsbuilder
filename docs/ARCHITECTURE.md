@@ -2,50 +2,109 @@
 
 ## Goals
 
-- Provide a repeatable, local pipeline to caption LoRA datasets.
-- Keep everything containerized where possible.
-- Minimize external dependencies and manual steps.
+- A repeatable local pipeline from raw photos to a training-ready dataset.
+- No dependence on any single captioning model.
+- Everything local: no images or captions leave the machine.
+- Containerised where a container earns its keep.
 
 ## Components
 
-### Florence-2 API (Docker)
-- Defined under `docker/` and launched via `start.ps1`.
-- Exposes `http://localhost:8080/caption` and `http://localhost:8080/health`.
+### `lib/Captioners.psm1`
 
-### Captioning pipeline (PowerShell)
-- `caption.ps1`:
-  - Starts the Florence-2 container (unless `-SkipAutoStart`).
-  - Sends images to the caption API.
-  - Optionally tagifies and normalizes captions (concept/pro-noun replacement).
-  - Writes `captions.json` and `captions.csv` into the image folder.
-  - Produces `caption_issues.csv` if validation flags are found.
+The core module, and the only place caption text is produced or transformed.
+`Get-ImageCaption` is the single entry point; everything else is a helper it
+composes. Keeping this logic in a module rather than in the CLI script is what
+makes it unit-testable without a GPU, a network call or a container.
 
-### Review UI (Gradio in Docker)
-- `review_ui.py`:
-  - Lightweight UI for stepping through images and editing captions.
-  - Uses `allowed_paths` set to the dataset directory.
-- `run-review-ui.ps1`:
-  - Builds the review UI image using `docker/Dockerfile.review`.
-  - Mounts the dataset folder to `/data` and launches the UI.
-  - Optionally reserves the port in `C:\AI\.registry.json`.
+Provider dispatch:
+
+```
+Get-ImageCaption -Provider ollama    -> Build-CaptionPrompt -> Invoke-OllamaCaption
+                                                            -> Remove-CaptionPreamble
+
+Get-ImageCaption -Provider florence  -> Invoke-FlorenceCaption
+                                     -> Remove-CaptionPreamble
+                                     -> Set-CaptionSubject
+                                     -> Limit-CaptionContent
+```
+
+The asymmetry is the point. An instructed model receives the rules up front and
+needs almost no cleanup. Florence-2 cannot be instructed, so the same rules have
+to be reapplied afterwards by hand - which is both lossier and where the
+pipeline's bugs historically lived.
+
+Both paths finish by normalising the trigger word to one spelling and guaranteeing
+it appears at least once.
+
+### Captioning providers
+
+| Provider | Transport | Runs in |
+|---|---|---|
+| `ollama` | `POST /api/generate`, image as base64 | Ollama (host or container), port 11434 |
+| `florence` | `POST /caption`, multipart upload | `docker/` FastAPI container, port 8080 |
+
+Adding a provider means adding an `Invoke-<Name>Caption` function and a branch in
+`Get-ImageCaption`; nothing else in the pipeline changes.
+
+Reasoning models are called with `think` disabled. Left on, the chain of thought
+is prepended to the caption; `Remove-CaptionPreamble` strips a surviving
+`<think>` block as a backstop.
+
+### `caption.ps1`
+
+A thin CLI over the module: resolve and sort the images, check the chosen provider
+is reachable, loop, validate, write. It holds no caption logic.
+
+Per-image failures are caught and recorded rather than thrown, so one unreadable
+file cannot discard the captions already produced in a long run.
+
+### Review UI
+
+`review_ui.py` is a small Gradio app that steps through the dataset, showing each
+image with its caption in an editable box. Every navigation action saves, so there
+is no unsaved state to lose. `run-review-ui.ps1` builds the image, mounts the
+dataset at `/data` and runs the export step when the UI exits.
+
+The container sees Linux paths while `captions.json` stores Windows paths, so
+images are resolved by filename against the mount point. This keeps the JSON
+portable: the stored path is never rewritten.
 
 ### Orchestration
-- `New-LoRA.ps1` integrates captioning and review in a broader workflow.
+
+`New-LoraDataset.ps1` is the guided front door: it collects concept details, copies and
+optionally resizes source images into the `<rate>_<concept>` layout kohya_ss
+expects, then calls caption -> review -> export. It stops at the point training
+would begin.
 
 ## Data flow
 
-1) User selects a dataset folder.
-2) `caption.ps1` generates captions via Florence-2.
-3) `review_ui.py` lets the user edit captions.
-4) Final `captions.json/csv` flow into downstream training tools.
+1. Images are copied (optionally resized) into the dataset folder.
+2. `caption.ps1` captions every image and writes `captions.json` / `captions.csv`.
+3. Validation flags empty, over/under-length and near-duplicate captions.
+4. The review UI is used to correct anything wrong; each edit saves immediately.
+5. `export-captions.ps1` writes one `<image>.txt` per image.
+6. kohya_ss trains from the folder.
 
-## Key paths
+## Testing
 
-- Dataset root (example):
-  `C:\AI\lora-dataset-builder\lora-training\<concept>\IMG\<rate>_<concept>`
-- Review UI container mount: `/data`
+`tests/Captioners.Tests.ps1` covers the module. The provider functions are mocked,
+so the suite needs no GPU, model or network and runs in about a second on both
+Windows and Linux.
+
+Cases marked `REGRESSION` encode defects that were shipping, and use real recorded
+model output rather than invented strings.
 
 ## Ports
 
-- Florence-2 API: 8080
-- Review UI: 7861 (default)
+| Service | Port |
+|---|---|
+| Ollama | 11434 |
+| Florence-2 API | 8080 (`FLORENCE_PORT`) |
+| Review UI | 7861 (`-Port`) |
+
+## Configuration
+
+`docker/.env` (see `.env.example`) holds model cache locations and the Florence
+port. The caches are large and shared between projects, so they live outside the
+repo; the compose file otherwise uses paths relative to itself so the repo can be
+cloned anywhere.

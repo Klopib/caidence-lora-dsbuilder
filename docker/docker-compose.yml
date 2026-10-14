@@ -1,3 +1,14 @@
+# Florence-2 caption API.
+#
+# Only required for the 'florence' captioning provider; the default 'ollama'
+# provider talks to Ollama instead and does not need this container.
+#
+# An explicit project name keeps `docker compose` from treating unrelated
+# containers as orphans of this stack. Without it the project name defaults to
+# the directory name ("docker"), which collides with every other compose file
+# kept in a folder of that name.
+name: lora-dataset-builder
+
 services:
   florence-2:
     build:
@@ -6,14 +17,17 @@ services:
     container_name: florence-2
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "${FLORENCE_PORT:-8080}:8080"
     volumes:
-      - C:/AI/lora-dataset-builder/data:/workspace/data
-      - C:/AI/models_master/huggingface:/root/.cache/huggingface
-      - C:/AI/models_master/torch:/root/.cache/torch
+      # Relative to this file, so the repo can live anywhere.
+      - ../data:/workspace/data
+      # Model caches are large and shared between projects, so they stay
+      # outside the repo. Override in docker/.env - see .env.example.
+      - ${HF_CACHE_DIR:-../.cache/huggingface}:/root/.cache/huggingface
+      - ${TORCH_CACHE_DIR:-../.cache/torch}:/root/.cache/torch
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
-      - FLORENCE_MODEL_ID=microsoft/Florence-2-large
+      - FLORENCE_MODEL_ID=${FLORENCE_MODEL_ID:-microsoft/Florence-2-large}
     deploy:
       resources:
         reservations:

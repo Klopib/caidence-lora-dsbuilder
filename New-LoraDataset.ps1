@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Prepares a dataset for LoRA training.
 
@@ -22,9 +22,9 @@
     Number of times each image is repeated during training.
 
 .EXAMPLE
-    .\New-LoRA.ps1
+    .\New-LoraDataset.ps1
 .EXAMPLE
-    .\New-LoRA.ps1 -ConceptName "my_character" -ConceptType character -SourceImagesPath "C:\Images\character"
+    .\New-LoraDataset.ps1 -ConceptName "my_character" -ConceptType character -SourceImagesPath .\photos\my_character
 #>
 
 param(
@@ -33,21 +33,41 @@ param(
     [ValidateSet("character", "clothing", "style", "object", "")]
     [string]$ConceptType,
     [int]$TrainingRate,
-    [string]$Instruction = "focus on the subject; ignore background objects"
+    [string]$Instruction = "",
+
+    # Captioning backend. 'ollama' follows instructions, so it needs no
+    # post-processing; 'florence' is the offline fallback.
+    [ValidateSet("ollama", "florence")]
+    [string]$Provider = "ollama",
+
+    [string]$Model = "qwen3.5",
+
+    # Comma-separated tags instead of prose. Tag captions suit booru-style base
+    # models (Pony, Illustrious); prose suits newer ones (Flux, SDXL).
+    [switch]$Tagify,
+
+    # Where prepared datasets are written. Resolution order:
+    #   1. -BaseDir
+    #   2. $env:LORA_DATASET_ROOT
+    #   3. a 'datasets' folder beside this script
+    # Point it at your trainer's data directory to write straight there.
+    [string]$BaseDir = $(
+        if ($env:LORA_DATASET_ROOT) { $env:LORA_DATASET_ROOT }
+        else { Join-Path $PSScriptRoot 'datasets' }
+    )
 )
 
-# ─── Config ─────────────────────────────────────────────────────────────────
+# --- Config -----------------------------------------------------------------
 
-$BaseDir = "C:\\AI\\lora-dataset-builder\\lora-training"
-$FlorenceDir = "C:\\AI\\lora-dataset-builder"
+$FlorenceDir = $PSScriptRoot
 $CaptionScript = Join-Path $FlorenceDir "caption.ps1"
 $ReviewScript  = Join-Path $FlorenceDir "run-review-ui.ps1"
 $ExportScript  = Join-Path $FlorenceDir "export-captions.ps1"
 $ErrorActionPreference = "Stop"
 
-# ─── Helpers ────────────────────────────────────────────────────────────────
+# --- Helpers ----------------------------------------------------------------
 
-function Prompt-String {
+function Read-StringValue {
     param([string]$Message, [string]$Default)
     $suffix = if ($Default) { " [$Default]" } else { "" }
     $val = Read-Host "$Message$suffix"
@@ -55,7 +75,7 @@ function Prompt-String {
     return $val.Trim()
 }
 
-function Prompt-Int {
+function Read-IntValue {
     param([string]$Message, [int]$Default = 0)
     while ($true) {
         $suffix = if ($Default) { " [$Default]" } else { "" }
@@ -67,12 +87,121 @@ function Prompt-Int {
     }
 }
 
-function Prompt-YesNo {
+function Read-YesNo {
     param([string]$Message, [bool]$Default = $true)
     $hint = if ($Default) { "[Y]/n" } else { "y/[N]" }
     $val = Read-Host "$Message ($hint)"
     if ([string]::IsNullOrWhiteSpace($val)) { return $Default }
     return ($val.Trim().ToLower() -in @("y", "yes"))
+}
+
+function Read-ResizeLongEdge {
+    Write-Host ""
+    Write-Host "Choose target size for the longest edge:" -ForegroundColor White
+    Write-Host "  1. 512px" -ForegroundColor White
+    Write-Host "  2. 1024px" -ForegroundColor White
+    Write-Host "  3. Custom value" -ForegroundColor White
+    Write-Host ""
+
+    while ($true) {
+        $choice = Read-Host "Choice (1-3)"
+        if ($choice -eq "1") { return 512 }
+        if ($choice -eq "2") { return 1024 }
+        if ($choice -eq "3") {
+            while ($true) {
+                $custom = Read-IntValue "Custom long-edge size (pixels)" -Default 768
+                if ($custom -ge 64) { return $custom }
+                Write-Host "  Please enter at least 64 pixels." -ForegroundColor Yellow
+            }
+        }
+        Write-Host "  Please enter 1, 2, or 3." -ForegroundColor Yellow
+    }
+}
+
+function Copy-ImageWithOptionalResize {
+    param(
+        [string]$SourcePath,
+        [string]$DestinationPath,
+        [int]$LongEdgeTarget
+    )
+
+    if (-not $script:SystemDrawingLoaded) {
+        Add-Type -AssemblyName System.Drawing
+        $script:SystemDrawingLoaded = $true
+    }
+
+    $destExt = [System.IO.Path]::GetExtension($DestinationPath).ToLowerInvariant()
+    $isJpegDest = $destExt -in @('.jpg', '.jpeg')
+
+    # Helper: save bitmap with appropriate encoder
+    function Save-Bitmap {
+        param($Bitmap, $Path)
+        $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+        if ($ext -in @('.jpg', '.jpeg')) {
+            $encoder = [System.Drawing.Imaging.Encoder]::Quality
+            $encoderParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
+            $encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter($encoder, 95L)
+            $jpegCodec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
+                Where-Object { $_.MimeType -eq 'image/jpeg' } |
+                Select-Object -First 1
+            $Bitmap.Save($Path, $jpegCodec, $encoderParams)
+        } elseif ($ext -eq '.png') {
+            $Bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+        } else {
+            $Bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Bmp)
+        }
+    }
+
+    $sourceImage = $null
+    $resizedBitmap = $null
+    $graphics = $null
+
+    try {
+        $sourceImage = [System.Drawing.Image]::FromFile($SourcePath)
+        $currentLongEdge = [Math]::Max($sourceImage.Width, $sourceImage.Height)
+
+        # No resize needed — but still may need format conversion (e.g. PNG → JPEG)
+        if ($LongEdgeTarget -le 0 -or $currentLongEdge -le $LongEdgeTarget) {
+            $sourceExt = [System.IO.Path]::GetExtension($SourcePath).ToLowerInvariant()
+            if ($isJpegDest -and $sourceExt -notin @('.jpg', '.jpeg')) {
+                # Format conversion without resize
+                $bitmap = New-Object System.Drawing.Bitmap($sourceImage)
+                try { Save-Bitmap $bitmap $DestinationPath }
+                finally { $bitmap.Dispose() }
+                return "CopiedNoResizeNeeded"
+            } else {
+                $sourceImage.Dispose()
+                $sourceImage = $null
+                Copy-Item -Path $SourcePath -Destination $DestinationPath -Force
+                return "CopiedNoResizeNeeded"
+            }
+        }
+
+        $scale = [double]$LongEdgeTarget / [double]$currentLongEdge
+        $newWidth  = [Math]::Max(1, [int][Math]::Round($sourceImage.Width  * $scale))
+        $newHeight = [Math]::Max(1, [int][Math]::Round($sourceImage.Height * $scale))
+
+        $resizedBitmap = New-Object System.Drawing.Bitmap($newWidth, $newHeight)
+        $graphics = [System.Drawing.Graphics]::FromImage($resizedBitmap)
+        $graphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+        $graphics.InterpolationMode  = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $graphics.SmoothingMode      = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+        $graphics.PixelOffsetMode    = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $graphics.DrawImage($sourceImage, 0, 0, $newWidth, $newHeight)
+
+        Save-Bitmap $resizedBitmap $DestinationPath
+        return "Resized"
+    }
+    catch {
+        if ($sourceImage) { $sourceImage.Dispose(); $sourceImage = $null }
+        Copy-Item -Path $SourcePath -Destination $DestinationPath -Force
+        return "CopiedResizeFailed"
+    }
+    finally {
+        if ($graphics)      { $graphics.Dispose() }
+        if ($resizedBitmap) { $resizedBitmap.Dispose() }
+        if ($sourceImage)   { $sourceImage.Dispose() }
+    }
 }
 
 function Show-TrainingRateInfo {
@@ -109,14 +238,14 @@ function Show-ImageSelectionGuide {
     Write-Host ""
     Write-Host "Key principle: DIVERSE yet HOMOGENEOUS" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "✓ DO include variety in:" -ForegroundColor Green
+    Write-Host "[ok] DO include variety in:" -ForegroundColor Green
     Write-Host "  • Poses and angles" -ForegroundColor White
     Write-Host "  • Lighting conditions (bright, dim, natural, artificial)" -ForegroundColor White
     Write-Host "  • Backgrounds (indoor, outdoor, plain, detailed)" -ForegroundColor White
     Write-Host "  • Colors and styles (if applicable to concept)" -ForegroundColor White
     Write-Host "  • Distances (close-up, full body, medium shots)" -ForegroundColor White
     Write-Host ""
-    Write-Host "✗ DON'T include:" -ForegroundColor Red
+    Write-Host "[!!] DON'T include:" -ForegroundColor Red
     Write-Host "  • Blurry or low-quality images" -ForegroundColor White
     Write-Host "  • Watermarked images (distracting)" -ForegroundColor White
     Write-Host "  • Images where concept is barely visible" -ForegroundColor White
@@ -130,7 +259,7 @@ function Show-ImageSelectionGuide {
     pause
 }
 
-function Analyze-Images {
+function Get-ImageAnalysis {
     param([string]$Path)
     
     $imageFiles = Get-ChildItem -Path $Path -Include *.png,*.jpg,*.jpeg,*.webp,*.bmp -File -Recurse
@@ -162,7 +291,7 @@ function Analyze-Images {
     }
 }
 
-# ─── Main Flow ──────────────────────────────────────────────────────────────
+# --- Main Flow --------------------------------------------------------------
 
 Write-Host ""
 Write-Host "╔═══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
@@ -171,17 +300,17 @@ Write-Host "║        (Structure, Copy, Florence Caption + Review)       ║" -
 Write-Host "╚═══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "This script will prepare your images for LoRA training." -ForegroundColor White
-Write-Host "Includes: folder setup, image copy, Florence-2 autocaption, review UI." -ForegroundColor DarkGray
+Write-Host "Includes: folder setup, image copy/resizing, Florence-2 autocaption, review UI." -ForegroundColor DarkGray
 Write-Host ""
 
-# ─── Step 1: Concept Name ───────────────────────────────────────────────────
+# --- Step 1: Concept Name ---------------------------------------------------
 
 if (-not $ConceptName) {
     Write-Host "What concept are you training?" -ForegroundColor White
     Write-Host "  Examples: 'moroccan_caftan', 'edg_character', 'cyberpunk_style'" -ForegroundColor DarkGray
     Write-Host "  Use underscores instead of spaces" -ForegroundColor DarkGray
     Write-Host ""
-    $ConceptName = Prompt-String "Concept name"
+    $ConceptName = Read-StringValue "Concept name"
     if (-not $ConceptName) {
         Write-Host "Concept name is required." -ForegroundColor Red
         pause
@@ -192,7 +321,7 @@ if (-not $ConceptName) {
 $ConceptName = $ConceptName.ToLower() -replace '\s+', '_' -replace '[^a-z0-9_-]', ''
 Write-Host "  Using concept name: $ConceptName" -ForegroundColor DarkGray
 
-# ─── Step 2: Concept Type ───────────────────────────────────────────────────
+# --- Step 2: Concept Type ---------------------------------------------------
 
 if (-not $ConceptType) {
     Write-Host ""
@@ -235,7 +364,7 @@ else {
 
 Write-Host "  Selected: $ConceptType (suggested training rate: $suggestedRate)" -ForegroundColor DarkGray
 
-# ─── Step 3: Source Images ──────────────────────────────────────────────────
+# --- Step 3: Source Images --------------------------------------------------
 
 if (-not $SourceImagesPath) {
     Write-Host ""
@@ -246,24 +375,24 @@ if (-not $SourceImagesPath) {
     Write-Host ""
     
     while ($true) {
-        $input = Read-Host "Image folder path (or H for help)"
-        if ($input -eq "H" -or $input -eq "h") {
+        $answer = Read-Host "Image folder path (or H for help)"
+        if ($answer -eq "H" -or $answer -eq "h") {
             Show-ImageSelectionGuide
             Write-Host "Where are your source images?" -ForegroundColor White
             continue
         }
-        $SourceImagesPath = $input.Trim('"').Trim("'")
+        $SourceImagesPath = $answer.Trim('"').Trim("'")
         if (Test-Path $SourceImagesPath) { break }
         Write-Host "  Path not found. Please try again." -ForegroundColor Yellow
     }
 }
 
-# ─── Step 4: Analyze Images ─────────────────────────────────────────────────
+# --- Step 4: Analyze Images -------------------------------------------------
 
 Write-Host ""
 Write-Host "Analyzing images..." -ForegroundColor Cyan
 
-$imageAnalysis = Analyze-Images -Path $SourceImagesPath
+$imageAnalysis = Get-ImageAnalysis -Path $SourceImagesPath
 
 if (-not $imageAnalysis) {
     Write-Host "No valid images found. Exiting." -ForegroundColor Red
@@ -272,10 +401,10 @@ if (-not $imageAnalysis) {
 }
 
 $imageCount = $imageAnalysis.Count
-Write-Host "  ✓ Found $imageCount images" -ForegroundColor Green
+Write-Host "  [ok] Found $imageCount images" -ForegroundColor Green
 
 if ($imageAnalysis.AvgWidth -ne "Unknown") {
-    Write-Host "  ✓ Sample resolution: $($imageAnalysis.AvgWidth)x$($imageAnalysis.AvgHeight)" -ForegroundColor Green
+    Write-Host "  [ok] Sample resolution: $($imageAnalysis.AvgWidth)x$($imageAnalysis.AvgHeight)" -ForegroundColor Green
 }
 
 # Quality check
@@ -285,7 +414,7 @@ if ($imageCount -lt 15) {
     Write-Host "  Your LoRA quality will be significantly limited." -ForegroundColor Yellow
     Write-Host "  Recommended minimum: 20 images" -ForegroundColor Yellow
     Write-Host ""
-    $continue = Prompt-YesNo "Continue anyway?" -Default $false
+    $continue = Read-YesNo "Continue anyway?" -Default $false
     if (-not $continue) {
         Write-Host "Cancelled. Please gather more images." -ForegroundColor Yellow
         pause
@@ -298,7 +427,7 @@ elseif ($imageCount -gt 100) {
     Write-Host "  More isn't always better! 25-40 diverse images often work best." -ForegroundColor Yellow
     Write-Host "  Consider curating down to your best, most diverse shots." -ForegroundColor Yellow
     Write-Host ""
-    $continue = Prompt-YesNo "Continue with all $imageCount images?" -Default $true
+    $continue = Read-YesNo "Continue with all $imageCount images?" -Default $true
     if (-not $continue) {
         Write-Host "Cancelled. Please curate your image set." -ForegroundColor Yellow
         pause
@@ -306,7 +435,27 @@ elseif ($imageCount -gt 100) {
     }
 }
 
-# ─── Step 5: Training Rate ──────────────────────────────────────────────────
+# --- Step 5: Optional Resize -------------------------------------------------
+
+$resizeImages = $false
+$resizeLongEdge = 0
+
+Write-Host ""
+Write-Host "Would you like to downsize images before training?" -ForegroundColor White
+Write-Host "  Only images larger than the selected size will be resized." -ForegroundColor DarkGray
+Write-Host "  The longest edge will be set to the target value." -ForegroundColor DarkGray
+
+$resizeImages = Read-YesNo "Resize images?" -Default $false
+
+if ($resizeImages) {
+    $resizeLongEdge = Read-ResizeLongEdge
+    Write-Host "  [ok] Resize enabled: longest edge = $resizeLongEdge px" -ForegroundColor Green
+}
+else {
+    Write-Host "  [ok] Resize disabled (images kept at original size)" -ForegroundColor Green
+}
+
+# --- Step 6: Training Rate --------------------------------------------------
 
 if (-not $TrainingRate -or $TrainingRate -le 0) {
     Write-Host ""
@@ -318,18 +467,18 @@ if (-not $TrainingRate -or $TrainingRate -le 0) {
     Write-Host ""
     
     while ($true) {
-        $input = Read-Host "Training rate per image [$suggestedRate] (or I for info)"
-        if ($input -eq "I" -or $input -eq "i") {
+        $answer = Read-Host "Training rate per image [$suggestedRate] (or I for info)"
+        if ($answer -eq "I" -or $answer -eq "i") {
             Show-TrainingRateInfo
             Write-Host "Training rate per image [$suggestedRate]:" -ForegroundColor White
             continue
         }
-        if ([string]::IsNullOrWhiteSpace($input)) {
+        if ([string]::IsNullOrWhiteSpace($answer)) {
             $TrainingRate = $suggestedRate
             break
         }
         $parsed = 0
-        if ([int]::TryParse($input, [ref]$parsed) -and $parsed -gt 0) {
+        if ([int]::TryParse($answer, [ref]$parsed) -and $parsed -gt 0) {
             $TrainingRate = $parsed
             break
         }
@@ -338,14 +487,18 @@ if (-not $TrainingRate -or $TrainingRate -le 0) {
 }
 
 $totalSteps = $imageCount * $TrainingRate
-Write-Host "  ✓ Training rate set to: $TrainingRate" -ForegroundColor Green
-Write-Host "  ✓ Total training steps per epoch: $totalSteps" -ForegroundColor Green
+Write-Host "  [ok] Training rate set to: $TrainingRate" -ForegroundColor Green
+Write-Host "  [ok] Total training steps per epoch: $totalSteps" -ForegroundColor Green
 
-# ─── Step 6: Summary ────────────────────────────────────────────────────────
+# --- Step 7: Summary --------------------------------------------------------
 
 $projectDir = Join-Path $BaseDir $ConceptName
-$imgDir = Join-Path $projectDir "IMG"
-$trainDir = Join-Path $imgDir "${TrainingRate}_${ConceptName}"
+$datasetsRootDir = Join-Path $projectDir "datasets"
+$datasetSetName = "set_r$TrainingRate"
+$datasetSetDir = Join-Path $datasetsRootDir $datasetSetName
+$trainDir = Join-Path $datasetSetDir "${TrainingRate}_${ConceptName}"
+$logDir = Join-Path $projectDir "log"
+$modelDir = Join-Path $projectDir "model"
 
 Write-Host ""
 Write-Host "╔═══════════════════════════════════════════════════════════╗" -ForegroundColor White
@@ -355,21 +508,28 @@ Write-Host ""
 Write-Host "  Concept Name:         $ConceptName" -ForegroundColor White
 Write-Host "  Concept Type:         $ConceptType" -ForegroundColor White
 Write-Host "  Source Images:        $imageCount images" -ForegroundColor White
+Write-Host "  Resize:               $(if ($resizeImages) { "Long edge = ${resizeLongEdge}px" } else { "No resizing" })" -ForegroundColor White
 Write-Host "  Training Rate:        $TrainingRate repeats/image" -ForegroundColor White
 Write-Host "  Steps Per Epoch:      $totalSteps" -ForegroundColor White
 Write-Host ""
 Write-Host "  Output Structure:" -ForegroundColor White
 Write-Host "    $projectDir\" -ForegroundColor DarkGray
-Write-Host "    └─ IMG\" -ForegroundColor DarkGray
-Write-Host "       └─ ${TrainingRate}_${ConceptName}\" -ForegroundColor DarkGray
-Write-Host "          ├─ 1.png" -ForegroundColor DarkGray
-Write-Host "          ├─ 2.png" -ForegroundColor DarkGray
-Write-Host "          └─ ... ($imageCount total)" -ForegroundColor DarkGray
+Write-Host "    -- datasets\" -ForegroundColor DarkGray
+Write-Host "    -  -- $datasetSetName\" -ForegroundColor DarkGray
+Write-Host "    -     -- ${TrainingRate}_${ConceptName}\" -ForegroundColor DarkGray
+Write-Host "    -        -- 1.png" -ForegroundColor DarkGray
+Write-Host "    -        -- 2.png" -ForegroundColor DarkGray
+Write-Host "    -        -- ... ($imageCount total)" -ForegroundColor DarkGray
+Write-Host "    -- log\" -ForegroundColor DarkGray
+Write-Host "    -- model\" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  Trainer path to use:" -ForegroundColor White
+Write-Host "    Training images folder = $datasetSetDir" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  (Caption files will be added in v2)" -ForegroundColor DarkGray
 Write-Host ""
 
-$confirm = Prompt-YesNo "Proceed with dataset preparation?" -Default $true
+$confirm = Read-YesNo "Proceed with dataset preparation?" -Default $true
 if (-not $confirm) {
     Write-Host ""
     Write-Host "Cancelled." -ForegroundColor Yellow
@@ -377,75 +537,112 @@ if (-not $confirm) {
     return
 }
 
-# ─── Step 7: Create Folder Structure ────────────────────────────────────────
+# --- Step 8: Create Folder Structure ----------------------------------------
 
 Write-Host ""
 Write-Host "Creating folder structure..." -ForegroundColor Cyan
 
-if (Test-Path $projectDir) {
+if (Test-Path $trainDir) {
     Write-Host ""
-    Write-Host "  ⚠ Project directory already exists: $projectDir" -ForegroundColor Yellow
-    $overwrite = Prompt-YesNo "Overwrite existing dataset?" -Default $false
-    if (-not $overwrite) {
-        Write-Host "Cancelled. Please choose a different concept name." -ForegroundColor Yellow
-        pause
-        return
+    Write-Host "  ⚠ Training directory already exists: $trainDir" -ForegroundColor Yellow
+    $keepOld = Read-YesNo "Keep the existing dataset (rename it with a timestamp)?" -Default $true
+    if ($keepOld) {
+        $createdTime = (Get-Item $trainDir).CreationTime.ToString("yyyy-MM-dd_HH-mm-ss")
+        $archivedName = "${TrainingRate}_${ConceptName}_$createdTime"
+        Rename-Item -Path $trainDir -NewName $archivedName
+        Write-Host "  [ok] Renamed existing dataset to: $archivedName" -ForegroundColor Green
+    } else {
+        Remove-Item -Path $trainDir -Recurse -Force
+        Write-Host "  [ok] Removed existing training directory" -ForegroundColor Green
     }
-    Remove-Item -Path $projectDir -Recurse -Force
-    Write-Host "  ✓ Removed existing directory" -ForegroundColor Green
 }
 
 New-Item -ItemType Directory -Path $projectDir -Force | Out-Null
-New-Item -ItemType Directory -Path $imgDir -Force | Out-Null
+New-Item -ItemType Directory -Path $datasetsRootDir -Force | Out-Null
+New-Item -ItemType Directory -Path $datasetSetDir -Force | Out-Null
 New-Item -ItemType Directory -Path $trainDir -Force | Out-Null
+New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+New-Item -ItemType Directory -Path $modelDir -Force | Out-Null
 
-Write-Host "  ✓ Created $projectDir" -ForegroundColor Green
-Write-Host "  ✓ Created $imgDir" -ForegroundColor Green
-Write-Host "  ✓ Created $trainDir" -ForegroundColor Green
+Write-Host "  [ok] Created $projectDir" -ForegroundColor Green
+Write-Host "  [ok] Created $datasetsRootDir" -ForegroundColor Green
+Write-Host "  [ok] Created $datasetSetDir" -ForegroundColor Green
+Write-Host "  [ok] Created $trainDir" -ForegroundColor Green
+Write-Host "  [ok] Created $logDir" -ForegroundColor Green
+Write-Host "  [ok] Created $modelDir" -ForegroundColor Green
 
-# ─── Step 8: Copy and Rename Images ─────────────────────────────────────────
+# --- Step 9: Copy/Rename (and Optional Resize) ------------------------------
 
 Write-Host ""
-Write-Host "Copying and renaming images..." -ForegroundColor Cyan
+if ($resizeImages) {
+    Write-Host "Copying, resizing, and renaming images..." -ForegroundColor Cyan
+}
+else {
+    Write-Host "Copying and renaming images..." -ForegroundColor Cyan
+}
 
 $counter = 1
+$resizedCount = 0
+$noResizeNeededCount = 0
+$resizeFailedCount = 0
 foreach ($imgFile in $imageAnalysis.Files) {
-    $extension = $imgFile.Extension
-    $newName = "$counter$extension"
+    $sourceExt = $imgFile.Extension.ToLower()
+    # Convert PNG/BMP/WebP → JPEG to avoid lossless bloat after resize
+    $destExt = if ($sourceExt -in @('.png', '.bmp', '.webp')) { '.jpg' } else { $sourceExt }
+    $newName = "$counter$destExt"
     $destPath = Join-Path $trainDir $newName
     
-    Copy-Item -Path $imgFile.FullName -Destination $destPath -Force
+    $copyResult = Copy-ImageWithOptionalResize -SourcePath $imgFile.FullName -DestinationPath $destPath -LongEdgeTarget $resizeLongEdge
+    if ($copyResult -eq "Resized") { $resizedCount++ }
+    elseif ($copyResult -eq "CopiedNoResizeNeeded") { $noResizeNeededCount++ }
+    elseif ($copyResult -eq "CopiedResizeFailed") { $resizeFailedCount++ }
     
     if ($counter % 10 -eq 0) {
-        Write-Host "  ✓ Processed $counter / $imageCount images..." -ForegroundColor DarkGray
+        Write-Host "  [ok] Processed $counter / $imageCount images..." -ForegroundColor DarkGray
     }
     
     $counter++
 }
 
-Write-Host "  ✓ All $imageCount images copied and renamed" -ForegroundColor Green
+Write-Host "  [ok] All $imageCount images copied and renamed" -ForegroundColor Green
+if ($resizeImages) {
+    Write-Host "  [ok] Resized images: $resizedCount" -ForegroundColor Green
+    Write-Host "  [ok] Already <= ${resizeLongEdge}px (copied as-is): $noResizeNeededCount" -ForegroundColor Green
+    if ($resizeFailedCount -gt 0) {
+        Write-Host "  ⚠ Resize unsupported/failed for $resizeFailedCount images; copied original files." -ForegroundColor Yellow
+    }
+}
 
-# ─── Step 9: Caption with Florence-2 ────────────────────────────────────────
+# --- Step 10: Autocaption ---------------------------------------------------
 
 Write-Host ""
-Write-Host "Running Florence-2 autocaptioning..." -ForegroundColor Cyan
+Write-Host "Running autocaptioning (provider: $Provider)..." -ForegroundColor Cyan
 
 if (-not (Test-Path $CaptionScript)) {
     throw "caption.ps1 not found at $CaptionScript"
 }
 
-& pwsh -File $CaptionScript `
-    -ImageDir $trainDir `
-    -Concept $ConceptName `
-    -Tagify `
-    -Overwrite `
-    -Instruction $Instruction
+# $trainDir already holds copies this script made from the source folder, so
+# captioning writes there directly. The source images are never touched.
+$captionArgs = @(
+    '-ImageDir', $trainDir
+    '-Concept', $ConceptName
+    '-Provider', $Provider
+    '-Model', $Model
+    '-InPlace'
+    '-Overwrite'
+)
+if ($ConceptType) { $captionArgs += @('-ConceptType', $ConceptType) }
+if ($Instruction) { $captionArgs += @('-Instruction', $Instruction) }
+if ($Tagify) { $captionArgs += '-Tagify' }
+
+& pwsh -File $CaptionScript @captionArgs
 
 if ($LASTEXITCODE -ne 0) { throw "Captioning failed (exit code $LASTEXITCODE)" }
 
-Write-Host "  ✓ Captions generated: captions.json / captions.csv" -ForegroundColor Green
+Write-Host "  [ok] Captions generated: captions.json / captions.csv" -ForegroundColor Green
 
-# ─── Step 10: Launch Review UI (Docker) ─────────────────────────────────────
+# --- Step 11: Launch Review UI (Docker) -------------------------------------
 
 Write-Host ""
 Write-Host "Launching caption review UI (Docker)..." -ForegroundColor Cyan
@@ -463,25 +660,35 @@ if ($LASTEXITCODE -ne 0) {
     throw "Review UI failed to start (exit code $LASTEXITCODE)"
 }
 
-# ─── Step 11: Export captions to .txt ───────────────────────────────────────
+# --- Step 12: Ensure captions are exported to .txt --------------------------
 
 Write-Host ""
-Write-Host "Exporting captions to .txt files..." -ForegroundColor Cyan
+$existingTxtCount = (Get-ChildItem -Path $trainDir -Filter "*.txt" -File -ErrorAction SilentlyContinue | Measure-Object).Count
 
-if (-not (Test-Path $ExportScript)) {
-    throw "export-captions.ps1 not found at $ExportScript"
+if ($existingTxtCount -gt 0) {
+    Write-Host "Captions already exported by review UI: $existingTxtCount .txt files found." -ForegroundColor Green
+} else {
+    Write-Host "No .txt captions found after review UI; running fallback export..." -ForegroundColor Yellow
+    if (-not (Test-Path $ExportScript)) {
+        throw "export-captions.ps1 not found at $ExportScript"
+    }
+
+    $captionsJsonPath = Join-Path $trainDir "captions.json"
+    if (-not (Test-Path $captionsJsonPath)) {
+        throw "captions.json not found at $captionsJsonPath"
+    }
+
+    & pwsh -File $ExportScript `
+        -CaptionsJson $captionsJsonPath `
+        -Overwrite
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Export captions failed (exit code $LASTEXITCODE)"
+    }
+    Write-Host "  [ok] Captions exported: $trainDir\*.txt" -ForegroundColor Green
 }
 
-& pwsh -File $ExportScript `
-    -CaptionsJson $outJson
-
-if ($LASTEXITCODE -ne 0) {
-    throw "Export captions failed (exit code $LASTEXITCODE)"
-}
-
-Write-Host "  ✓ Captions exported: $trainDir\*.txt" -ForegroundColor Green
-
-# ─── Step 12: Create Info File ───────────────────────────────────────────────
+# --- Step 13: Create Info File -----------------------------------------------
 
 $infoContent = @"
 LoRA Dataset: $ConceptName
@@ -490,6 +697,7 @@ Created: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 Configuration:
 - Concept Type: $ConceptType
 - Image Count: $imageCount
+- Resize: $(if ($resizeImages) { "Long edge = ${resizeLongEdge}px" } else { "No resizing" })
 - Training Rate: $TrainingRate
 - Steps Per Epoch: $totalSteps
 
@@ -499,7 +707,9 @@ Next Steps:
 1. Captions generated automatically (captions.json/captions.csv) in $trainDir
 2. Review/edit captions in the browser UI (launched automatically)
 3. Captions exported to per-image .txt files in $trainDir
-4. Close the UI when finished; proceed to training (kohya_ss config step)
+4. In trainer UI, set "Training images folder" to: $datasetSetDir
+5. Close the UI when finished; proceed to training (kohya_ss config step)
+6. Use $modelDir as the default output folder for configs and trained .safetensors
 
 Notes:
 - Captions are tag-based and begin with concept name: $ConceptName
@@ -509,9 +719,9 @@ Notes:
 $infoPath = Join-Path $projectDir "dataset_info.txt"
 $infoContent | Set-Content -Path $infoPath -Encoding UTF8
 
-Write-Host "  ✓ Created dataset info file" -ForegroundColor Green
+Write-Host "  [ok] Created dataset info file" -ForegroundColor Green
 
-# ─── Final Output ───────────────────────────────────────────────────────────
+# --- Final Output -----------------------------------------------------------
 
 Write-Host ""
 Write-Host "╔═══════════════════════════════════════════════════════════╗" -ForegroundColor Green
@@ -522,14 +732,20 @@ Write-Host "Your dataset is ready at:" -ForegroundColor White
 Write-Host "  $projectDir" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "What's been set up:" -ForegroundColor White
-Write-Host "  ✓ Folder structure created" -ForegroundColor Green
-Write-Host "  ✓ $imageCount images copied and renamed (1.png, 2.png, ...)" -ForegroundColor Green
-Write-Host "  ✓ Training rate: $TrainingRate ($totalSteps steps/epoch)" -ForegroundColor Green
-Write-Host "  ✓ Captions generated: $trainDir\\captions.json / captions.csv" -ForegroundColor Green
-Write-Host "  ✓ Review UI launched at the chosen port (ctrl+c to stop when done)" -ForegroundColor Green
+Write-Host "  [ok] Folder structure created" -ForegroundColor Green
+Write-Host "  [ok] $imageCount images copied and renamed (1.png, 2.png, ...)" -ForegroundColor Green
+if ($resizeImages) {
+    Write-Host "  [ok] Resize applied to $resizedCount images (long edge = ${resizeLongEdge}px)" -ForegroundColor Green
+}
+Write-Host "  [ok] Training rate: $TrainingRate ($totalSteps steps/epoch)" -ForegroundColor Green
+Write-Host "  [ok] Captions generated: $trainDir\\captions.json / captions.csv" -ForegroundColor Green
+Write-Host "  [ok] Training images folder for trainer: $datasetSetDir" -ForegroundColor Green
+Write-Host "  [ok] Log folder ready: $logDir" -ForegroundColor Green
+Write-Host "  [ok] Model output folder ready: $modelDir" -ForegroundColor Green
+Write-Host "  [ok] Review UI launched at the chosen port (ctrl+c to stop when done)" -ForegroundColor Green
 Write-Host ""
 
-$openExplorer = Prompt-YesNo "Open dataset folder in Explorer?" -Default $true
+$openExplorer = Read-YesNo "Open dataset folder in Explorer?" -Default $true
 if ($openExplorer) {
     explorer $trainDir
 }

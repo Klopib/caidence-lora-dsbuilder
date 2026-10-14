@@ -1,9 +1,14 @@
 # Local datasets and outputs
+datasets/
 lora-training/
 data/
 **/captions.json
 **/captions.csv
 **/caption_issues.csv
+
+# Local docker environment (may contain HF_TOKEN)
+docker/.env
+.cache/
 
 # Python
 __pycache__/
@@ -12,6 +17,9 @@ __pycache__/
 
 # Logs
 *.log
+
+# Editor
+.vscode/
 
 # OS
 .DS_Store

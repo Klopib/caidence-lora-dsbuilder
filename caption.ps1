@@ -1,275 +1,359 @@
 <#
-  Batch captioning helper for Florence-2.
-  Usage:
-    ./caption.ps1 -ImageDir "C:\AI\lora-training\mikey\IMG\12_mikey" -Concept "mikey"
-  Optional:
-    -Task "<MORE_DETAILED_CAPTION>"        # Florence prompt token
-    -Endpoint "http://localhost:8080/caption"
-    -Tagify                               # turn prose into simple comma tags
-    -Overwrite                            # re-caption even if captions.json exists
-    -Instruction "focus on subject"       # optional plain-English guidance appended to the task
-    -ReviewUI                             # open a Gradio review UI to step through captions
-    -PythonExe "C:\Users\admin\AppData\Local\Programs\Python\Python310\python.exe" # Python for Gradio UI
+.SYNOPSIS
+    Batch-captions an image folder for LoRA training.
+
+.DESCRIPTION
+    Captions every image in a folder and writes captions.json, captions.csv and,
+    when validation flags anything, caption_issues.csv.
+
+    Two providers are supported:
+
+      ollama    (default) An instruction-following vision model served by Ollama.
+                The captioning rules travel in the prompt, so captions come back
+                already in training form.
+
+      florence  A Florence-2 API in Docker. Florence cannot take instructions, so
+                its output is normalised afterwards. Kept as an offline fallback.
+
+.PARAMETER ImageDir
+    Folder containing the images to caption.
+
+.PARAMETER Concept
+    Trigger word for the concept being trained, e.g. "mikey".
+
+.PARAMETER Provider
+    Captioning backend: ollama (default) or florence.
+
+.PARAMETER ConceptType
+    character (default), clothing, style or object. Shapes the prompt: for a
+    character the model is told to skip fixed identity traits.
+
+.PARAMETER Instruction
+    Extra plain-English guidance passed to the model.
+
+.PARAMETER Tagify
+    Ask for comma-separated tags instead of prose clauses.
+
+.PARAMETER Overwrite
+    Re-caption even when captions.json already exists.
+
+.NOTES
+    The source folder is never written to. Images are copied into the output
+    dataset folder and captioned there, so a run can always be repeated from
+    the same untouched source.
+
+.EXAMPLE
+    # Builds ./datasets/mikey from the source images, leaving the source alone.
+    ./caption.ps1 -ImageDir .\photos\mikey -Concept mikey
+
+.EXAMPLE
+    ./caption.ps1 -ImageDir .\photos\mikey -Concept mikey -OutputDir D:\training\mikey
+
+.EXAMPLE
+    # Re-caption an existing dataset folder in place.
+    ./caption.ps1 -ImageDir .\datasets\mikey -Concept mikey -InPlace -Overwrite
 #>
 
+[CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true)][string]$ImageDir,
-  [Parameter(Mandatory = $true)][string]$Concept,
-  [string]$Task = "<MORE_DETAILED_CAPTION>",
-  [string]$Endpoint = "http://localhost:8080/caption",
-  [string]$Instruction,
-  [switch]$Tagify,
-  [switch]$Overwrite,
-  [switch]$ReviewUI,
-  [int]$ReviewPort = 7860,
-  [string[]]$PythonExe = @("C:\Users\admin\AppData\Local\Programs\Python\Python310\python.exe"),
-  [string]$ReviewVenvPath = (Join-Path $PSScriptRoot ".venv_review"),
-  [string]$FlorenceRoot = $PSScriptRoot,   # repo root that contains /docker
-  [switch]$SkipAutoStart                    # set if you want to manage Docker yourself
+    # Source images. Treated as read-only: nothing is ever written here.
+    [Parameter(Mandatory)][string]$ImageDir,
+
+    [Parameter(Mandatory)][string]$Concept,
+
+    # Where the dataset is built. Source images are copied here, and captions
+    # are written beside the copies so the folder is a complete training set.
+    # Resolution order:
+    #   1. -OutputDir
+    #   2. $env:LORA_DATASET_ROOT/<Concept>
+    #   3. <repo>/datasets/<Concept>
+    [string]$OutputDir,
+
+    # Write captions directly into -ImageDir instead of staging a copy. Only
+    # for folders that are already a working dataset, never a source folder.
+    [switch]$InPlace,
+
+    [ValidateSet('ollama', 'florence')]
+    [string]$Provider = 'ollama',
+
+    [ValidateSet('character', 'clothing', 'style', 'object')]
+    [string]$ConceptType = 'character',
+
+    [string]$Instruction = '',
+    [switch]$Tagify,
+    [switch]$Overwrite,
+
+    # Ollama provider
+    [string]$Model = 'qwen3.5',
+    [string]$OllamaEndpoint = 'http://localhost:11434',
+
+    # Florence provider
+    [string]$Task = '<MORE_DETAILED_CAPTION>',
+    [string]$FlorenceEndpoint = 'http://localhost:8080',
+
+    [int]$TimeoutSec = 300,
+    [switch]$SkipAutoStart
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
 
-function Ensure-Florence {
-  param([string]$ComposeDir)
+Import-Module (Join-Path $PSScriptRoot 'lib/Captioners.psm1') -Force
 
-  if ($SkipAutoStart) {
-    Write-Host "SkipAutoStart set; assuming Florence API is already up at $Endpoint" -ForegroundColor Yellow
-    return
-  }
+$ImageExtensions = @('.png', '.jpg', '.jpeg', '.webp', '.bmp')
 
-  $running = docker ps --filter "name=florence-2" --format "{{.Names}}"
-  if (-not $running) {
-    Write-Host "Starting florence-2 container via docker compose..." -ForegroundColor Cyan
-    Push-Location $ComposeDir
-    docker compose up -d
-    $code = $LASTEXITCODE
-    Pop-Location
-    if ($code -ne 0) {
-      throw "docker compose up failed (exit $code)"
+
+function Wait-ForEndpoint {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$Name,
+        [int]$Retries = 30,
+        [int]$DelaySeconds = 2
+    )
+
+    for ($i = 1; $i -le $Retries; $i++) {
+        try {
+            Invoke-RestMethod -Method Get -Uri $Url -TimeoutSec 5 | Out-Null
+            Write-Host "  $Name ready (attempt $i)." -ForegroundColor Green
+            return
+        }
+        catch {
+            Start-Sleep -Seconds $DelaySeconds
+        }
     }
-  } else {
-    Write-Host "florence-2 container already running." -ForegroundColor DarkGray
-  }
+
+    throw "$Name did not become ready at $Url after $Retries attempts."
 }
 
-function Wait-FlorenceReady {
-  param([string]$HealthUrl, [int]$Retries = 30, [int]$DelaySeconds = 2)
-  for ($i = 1; $i -le $Retries; $i++) {
+
+function Initialize-OllamaProvider {
+    Write-Host "Checking Ollama at $OllamaEndpoint ..." -ForegroundColor Cyan
+
     try {
-      $resp = Invoke-RestMethod -Method Get -Uri $HealthUrl -TimeoutSec 5
-      if ($resp.status -eq "ok") {
-        Write-Host "Florence healthcheck passed on attempt $i." -ForegroundColor Green
-        return
-      }
-    } catch {}
-    Start-Sleep -Seconds $DelaySeconds
-  }
-  throw "Florence API did not become ready at $HealthUrl after $Retries attempts."
+        $tags = Invoke-RestMethod -Method Get -Uri "$OllamaEndpoint/api/tags" -TimeoutSec 10
+    }
+    catch {
+        throw "Cannot reach Ollama at $OllamaEndpoint. Start it with: docker start ollama"
+    }
+
+    $available = @($tags.models | ForEach-Object { $_.name })
+    if ($available.Count -eq 0) {
+        throw "Ollama is running but has no models. Pull one with: ollama pull $Model"
+    }
+
+    # Ollama tags are "name:tag"; accept a bare name as matching its default tag.
+    $matched = $available | Where-Object { $_ -eq $Model -or $_ -like "$Model`:*" } | Select-Object -First 1
+    if (-not $matched) {
+        throw ("Model '$Model' not found in Ollama. Available: {0}" -f ($available -join ', '))
+    }
+
+    Write-Host "  Using model $matched." -ForegroundColor Green
+    return @{
+        Model      = $Model
+        Endpoint   = $OllamaEndpoint
+        TimeoutSec = $TimeoutSec
+    }
 }
 
-function Ensure-Gradio {
-  $cmd = $PythonExe
-  if ($cmd.Count -eq 1 -and $cmd[0] -match '\s') { $cmd = $cmd[0] -split '\s+' }
-  if ($cmd.Count -eq 1 -and -not (Test-Path $cmd[0])) { $cmd = @("py", "-3.10") }
-  & $cmd -c "import gradio" 2>$null
-  if ($LASTEXITCODE -ne 0) {
-    throw "gradio not available in Python '$($cmd -join ' ')'. Install with: $($cmd -join ' ') -m pip install --only-binary=:all: gradio==4.44.1"
-  }
-  return $cmd
+
+function Initialize-FlorenceProvider {
+    $composeDir = Join-Path $PSScriptRoot 'docker'
+
+    if (-not $SkipAutoStart) {
+        $running = docker ps --filter 'name=florence-2' --format '{{.Names}}' 2>$null
+        if (-not $running) {
+            if (-not (Test-Path (Join-Path $composeDir 'docker-compose.yml'))) {
+                throw "docker-compose.yml not found under $composeDir."
+            }
+
+            Write-Host 'Starting florence-2 container ...' -ForegroundColor Cyan
+            Push-Location $composeDir
+            try {
+                docker compose up -d
+                if ($LASTEXITCODE -ne 0) { throw "docker compose up failed (exit $LASTEXITCODE)." }
+            }
+            finally {
+                Pop-Location
+            }
+        }
+        else {
+            Write-Host 'florence-2 container already running.' -ForegroundColor DarkGray
+        }
+    }
+
+    Wait-ForEndpoint -Url "$FlorenceEndpoint/health" -Name 'Florence-2 API'
+
+    return @{
+        Task       = $Task
+        Endpoint   = "$FlorenceEndpoint/caption"
+        TimeoutSec = $TimeoutSec
+    }
 }
 
-function Get-FreePort {
-  param([int]$Preferred = 7860, [int]$Tries = 20)
-  for ($i = 0; $i -lt $Tries; $i++) {
-    $port = $Preferred + $i
-    $listener = New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Parse("127.0.0.1"), $port)
+
+# --- Validate inputs --------------------------------------------------------
+
+if (-not (Test-Path -LiteralPath $ImageDir)) {
+    throw "ImageDir not found: $ImageDir"
+}
+
+$sourceDir = (Resolve-Path -LiteralPath $ImageDir).ProviderPath
+
+$sourceImages = @(
+    Get-ChildItem -LiteralPath $sourceDir -File -Recurse |
+        Where-Object { $ImageExtensions -contains $_.Extension.ToLowerInvariant() } |
+        Sort-Object @{ Expression = {
+                # Natural sort: 2.jpg before 10.jpg.
+                $m = [regex]::Match($_.BaseName, '\d+')
+                if ($m.Success) { [int]$m.Value } else { [int]::MaxValue }
+            }
+        }, FullName
+)
+
+if ($sourceImages.Count -eq 0) {
+    throw "No images found under $sourceDir (looked for $($ImageExtensions -join ', '))."
+}
+
+# --- Decide where the dataset is built --------------------------------------
+
+if ($InPlace) {
+    if ($OutputDir) {
+        throw 'Pass either -OutputDir or -InPlace, not both.'
+    }
+    $datasetDir = $sourceDir
+}
+else {
+    if (-not $OutputDir) {
+        $root = if ($env:LORA_DATASET_ROOT) { $env:LORA_DATASET_ROOT }
+        else { Join-Path $PSScriptRoot 'datasets' }
+        $OutputDir = Join-Path $root $Concept
+    }
+
+    if (-not (Test-Path -LiteralPath $OutputDir)) {
+        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    }
+    $datasetDir = (Resolve-Path -LiteralPath $OutputDir).ProviderPath
+
+    # Writing captions into the folder the user pointed at as input would
+    # modify their source data. Require -InPlace to say so explicitly.
+    if ($datasetDir -eq $sourceDir) {
+        throw ("-OutputDir is the same folder as -ImageDir. Source images are " +
+            "treated as read-only; pass -InPlace if you really mean to write there.")
+    }
+}
+
+$outJson = Join-Path $datasetDir 'captions.json'
+$outCsv = Join-Path $datasetDir 'captions.csv'
+$outIssues = Join-Path $datasetDir 'caption_issues.csv'
+
+if ((Test-Path -LiteralPath $outJson) -and -not $Overwrite) {
+    Write-Host "captions.json already exists in $datasetDir; pass -Overwrite to regenerate." -ForegroundColor Yellow
+    exit 0
+}
+
+# --- Stage the images -------------------------------------------------------
+
+if ($InPlace) {
+    $images = $sourceImages
+}
+else {
+    Write-Host "Staging $($sourceImages.Count) image(s) into $datasetDir ..." -ForegroundColor Cyan
+
+    $images = [System.Collections.Generic.List[object]]::new()
+    $usedNames = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($source in $sourceImages) {
+        # -Recurse flattens subfolders, so two files can share a name.
+        $name = $source.Name
+        if (-not $usedNames.Add($name)) {
+            $stem = [System.IO.Path]::GetFileNameWithoutExtension($source.Name)
+            $ext = $source.Extension
+            $n = 2
+            do { $name = "${stem}_$n$ext"; $n++ } while (-not $usedNames.Add($name))
+            Write-Host "  name collision: $($source.Name) staged as $name" -ForegroundColor Yellow
+        }
+
+        $destination = Join-Path $datasetDir $name
+        Copy-Item -LiteralPath $source.FullName -Destination $destination -Force
+        $images.Add((Get-Item -LiteralPath $destination))
+    }
+
+    Write-Host "  Source folder left unmodified: $sourceDir" -ForegroundColor DarkGray
+}
+
+# --- Prepare the provider ---------------------------------------------------
+
+$providerOptions = switch ($Provider) {
+    'ollama' { Initialize-OllamaProvider }
+    'florence' { Initialize-FlorenceProvider }
+}
+
+Write-Host ''
+Write-Host "Captioning $($images.Count) image(s) with provider '$Provider'." -ForegroundColor Cyan
+Write-Host "  Concept: $Concept ($ConceptType)" -ForegroundColor DarkGray
+Write-Host ''
+
+# --- Caption ----------------------------------------------------------------
+
+$results = [System.Collections.Generic.List[object]]::new()
+$failures = [System.Collections.Generic.List[object]]::new()
+$index = 0
+
+foreach ($image in $images) {
+    $index++
+    $label = '[{0}/{1}] {2}' -f $index, $images.Count, $image.Name
+    Write-Host $label -ForegroundColor DarkGray
+
     try {
-      $listener.Start()
-      $listener.Stop()
-      return $port
-    } catch {
-      continue
+        $caption = Get-ImageCaption -Path $image.FullName -Trigger $Concept `
+            -Provider $Provider -Instruction $Instruction -ConceptType $ConceptType `
+            -Tagify:$Tagify -ProviderOptions $providerOptions
+
+        $results.Add($caption)
+        Write-Host "    $($caption.final_caption)" -ForegroundColor Gray
     }
-  }
-  throw "Could not find a free port starting at $Preferred"
-}
-
-function Start-ReviewUI {
-  param([string]$JsonPath, [string]$CsvPath)
-  $cmd = Ensure-Gradio
-  $uiScript = Join-Path $PSScriptRoot "review_ui.py"
-  if (-not (Test-Path $uiScript)) {
-    throw "review_ui.py not found at $uiScript"
-  }
-  $port = Get-FreePort -Preferred $ReviewPort
-  Write-Host "Launching review UI at http://127.0.0.1:$port ..." -ForegroundColor Green
-  & $cmd $uiScript --captions $JsonPath --csv $CsvPath --concept $Concept --port $port
-}
-
-if (-not (Test-Path $ImageDir)) {
-  throw "ImageDir not found: $ImageDir"
-}
-
-$outJson = Join-Path $ImageDir "captions.json"
-$outCsv  = Join-Path $ImageDir "captions.csv"
-
-if (-not $Overwrite -and (Test-Path $outJson)) {
-  Write-Host "captions.json already exists; use -Overwrite to regenerate." -ForegroundColor Yellow
-  exit 0
-}
-
-$composeDir = Join-Path $FlorenceRoot "docker"
-if (-not (Test-Path (Join-Path $composeDir "docker-compose.yml"))) {
-  throw "Cannot locate docker-compose.yml under $composeDir. Use -FlorenceRoot to point at florence-2 repo."
-}
-
-Ensure-Florence -ComposeDir $composeDir
-Wait-FlorenceReady -HealthUrl "http://localhost:8080/health"
-
-function Get-FlorenceCaption {
-  param([string]$Path)
-
-  $form = @{
-    file = Get-Item $Path
-    task = $Task
-  }
-
-  $resp = Invoke-RestMethod -Method Post -Uri $Endpoint -Form $form -TimeoutSec 300
-
-  # Result may be keyed by task token or "caption"
-  if ($resp.result.$Task) { return [string]$resp.result.$Task }
-  if ($resp.result.caption) { return [string]$resp.result.caption }
-  if ($resp.result) { return [string]$resp.result }
-  return ""
-}
-
-function Convert-ToTags {
-  param([string]$Caption)
-
-  # Light tag extraction: split on punctuation/and, drop articles, lower-case.
-  $clean = ($Caption -replace '[\r\n]', ' ') -replace '[\.;]', ',' -replace '\s+', ' '
-  $parts = $clean -split ',| and '
-  $tags = foreach ($p in $parts) {
-    $t = $p.Trim().ToLower()
-    if (-not $t) { continue }
-    $t = $t -replace '^(a|an|the)\s+', ''
-    if ($t) { $t }
-  }
-  $unique = $tags | Where-Object { $_ } | Select-Object -Unique
-  return ($unique -join ', ')
-}
-
-function Replace-Subject {
-  param([string]$Text)
-  # Normalize references to people to the concept name (assumes single subject per image).
-  $out = $Text
-  $out = $out -replace "(?i)\b(man|woman|boy|girl)'s", "$Concept's"
-  $out = $out -replace "(?i)\b(man|woman|boy|girl)\b", $Concept
-  $out = $out -replace "(?i)\ba\s+$([regex]::Escape($Concept))\b", $Concept
-  $out = $out -replace "(?i)\ban\s+$([regex]::Escape($Concept))\b", $Concept
-  # Pronouns -> concept
-  $out = $out -replace "(?i)\b(he|she|they)\s+is\b", "$Concept is"
-  $out = $out -replace "(?i)\b(he|she|they)\s+was\b", "$Concept was"
-  $out = $out -replace "(?i)\b(he|she|they)\s+has\b", "$Concept has"
-  $out = $out -replace "(?i)\b(he|she|they)\s+have\b", "$Concept have"
-  $out = $out -replace "(?i)\b(he|she|they)\s+wearing\b", "$Concept wearing"
-  $out = $out -replace "(?i)\b(his|her|their)\b", "$Concept's"
-  $out = $out -replace "(?i)\b(him|her|them)\b", $Concept
-  $out = $out -replace "(?i)\b(he|she|they)\b", $Concept
-  return $out
-}
-
-function Apply-Instruction {
-  param([string]$Caption)
-  if ([string]::IsNullOrWhiteSpace($Instruction)) { return $Caption }
-
-  $text = $Caption
-  $instr = $Instruction.ToLower()
-
-  if ($instr -match "ignore background|less background|focus on (the )?(subject|person)|focus on the man") {
-    $parts = $text -split ',\s*'
-    $filtered = $parts | Where-Object { $_ -notmatch 'background|wall|door|window|room|house|building|trees?|sky' }
-    if ($filtered.Count -gt 0) {
-      $text = ($filtered -join ', ')
+    catch {
+        # One bad image should not discard the captions already earned.
+        Write-Host "    FAILED: $($_.Exception.Message)" -ForegroundColor Red
+        $failures.Add([pscustomobject]@{ image = $image.FullName; issue = "Caption failed: $($_.Exception.Message)" })
     }
-  }
-
-  return $text
 }
 
-function Get-Jaccard {
-  param([string]$A, [string]$B)
-  $setA = [System.Collections.Generic.HashSet[string]]::new(($A -split ',\s*'))
-  $setB = [System.Collections.Generic.HashSet[string]]::new(($B -split ',\s*'))
-  $inter = ($setA | Where-Object { $setB.Contains($_) }).Count
-  $union = ($setA + $setB | Select-Object -Unique).Count
-  if ($union -eq 0) { return 0 }
-  return [double]$inter / $union
+if ($results.Count -eq 0) {
+    throw 'Every image failed to caption. Nothing written.'
 }
 
-$images = Get-ChildItem -Path $ImageDir -Include *.png,*.jpg,*.jpeg,*.webp -Recurse |
-  Sort-Object @{Expression = {
-      $m = [regex]::Match($_.BaseName, '\d+')
-      if ($m.Success) { [int]$m.Value } else { [int]::MaxValue }
-    }}, @{Expression = { $_.FullName }}
-if (-not $images) {
-  throw "No images found under $ImageDir"
+# --- Write outputs ----------------------------------------------------------
+
+# -AsArray keeps a single-image run a JSON array, which review_ui.py requires.
+$results | ConvertTo-Json -Depth 5 -AsArray | Set-Content -LiteralPath $outJson -Encoding utf8
+$results | Export-Csv -LiteralPath $outCsv -Encoding utf8 -NoTypeInformation
+
+$captionStyle = if ($Tagify) { 'tags' } else { 'prose' }
+$issues = @(Test-CaptionSet -Captions $results.ToArray() -Style $captionStyle -ConceptType $ConceptType) +
+@($failures.ToArray())
+
+if ($issues.Count -gt 0) {
+    $issues | Export-Csv -LiteralPath $outIssues -Encoding utf8 -NoTypeInformation
+    Write-Host ''
+    Write-Host "$($issues.Count) validation flag(s) written to $outIssues" -ForegroundColor Yellow
+}
+else {
+    if (Test-Path -LiteralPath $outIssues) { Remove-Item -LiteralPath $outIssues -Force }
+    Write-Host ''
+    Write-Host 'No validation flags.' -ForegroundColor Green
 }
 
-$result = @()
-foreach ($img in $images) {
-  Write-Host "Captioning $($img.FullName)" -ForegroundColor DarkGray
-  $raw = Get-FlorenceCaption -Path $img.FullName
-  $body = if ($Tagify) { Convert-ToTags -Caption $raw } else { $raw.Trim() }
-  $body = Replace-Subject -Text $body
-  $body = Apply-Instruction -Caption $body
-  $final = if ($body.StartsWith($Concept, 'InvariantCultureIgnoreCase')) {
-    $body
-  } else {
-    "$Concept, $body"
-  }
-
-  $result += [pscustomobject]@{
-    image         = $img.FullName
-    raw_caption   = $raw
-    final_caption = $final
-  }
+Write-Host "Captioned $($results.Count)/$($images.Count) image(s)." -ForegroundColor Green
+Write-Host "Dataset: $datasetDir" -ForegroundColor Green
+Write-Host "  $outJson" -ForegroundColor DarkGray
+Write-Host "  $outCsv" -ForegroundColor DarkGray
+if (-not $InPlace) {
+    Write-Host "Source images untouched: $sourceDir" -ForegroundColor DarkGray
 }
 
-# Simple validation: length and near-duplicates.
-$issues = @()
-for ($i = 0; $i -lt $result.Count; $i++) {
-  $cap = $result[$i].final_caption
-  $tags = $cap -split ',\s*'
-  if ($tags.Count -lt 4 -or $tags.Count -gt 40) {
-    $issues += [pscustomobject]@{ image = $result[$i].image; issue = "Tag count=$($tags.Count)" }
-  }
-  for ($j = $i + 1; $j -lt $result.Count; $j++) {
-    $sim = Get-Jaccard -A $cap -B $result[$j].final_caption
-    if ($sim -gt 0.85) {
-      $issues += [pscustomobject]@{
-        image = $result[$i].image
-        issue = "Too similar to $($result[$j].image) (Jaccard=$('{0:N2}' -f $sim))"
-      }
-    }
-  }
+if ($failures.Count -gt 0) {
+    Write-Host "$($failures.Count) image(s) failed. See $outIssues" -ForegroundColor Red
+    exit 1
 }
-
-$result | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $outJson
-$result | Export-Csv -Encoding utf8 -NoTypeInformation $outCsv
-
-if ($issues.Count) {
-  $issuesPath = Join-Path $ImageDir "caption_issues.csv"
-  $issues | Export-Csv -Encoding utf8 -NoTypeInformation $issuesPath
-  Write-Host "Validation issues logged to $issuesPath" -ForegroundColor Yellow
-} else {
-  Write-Host "No validation flags." -ForegroundColor Green
-}
-
-Write-Host "Saved captions to $outJson and $outCsv" -ForegroundColor Green
-
-if ($ReviewUI) {
-  Start-ReviewUI -JsonPath $outJson -CsvPath $outCsv
-}
-

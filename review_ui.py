@@ -34,6 +34,9 @@ JSON_PATH = ""
 CSV_PATH = ""
 DATA_DIR = ""
 
+# Display height of the review image, in pixels.
+IMAGE_HEIGHT = 480
+
 
 def schedule_exit(delay=0.5):
     def _exit_later():
@@ -226,9 +229,32 @@ def main():
     if args.concept:
         title += f" – {args.concept}"
 
-    with gr.Blocks(title=title) as demo:
+    # Gradio's height= sizes the component, not the <img> inside it, so a photo
+    # larger than the container renders cropped rather than scaled. Constrain
+    # the image itself and use contain so the whole frame stays visible --
+    # a reviewer cannot judge a caption against a cropped image.
+    # max-width matters as much as max-height: a 16:9 photo bounded only by
+    # height would render ~854px wide and overflow the container sideways.
+    css = """
+    #review-image { height: %(h)dpx; }
+    #review-image img {
+        max-height: %(h)dpx;
+        max-width: 100%%;
+        width: auto;
+        height: auto;
+        margin: 0 auto;
+        object-fit: contain;
+    }
+    """ % {"h": IMAGE_HEIGHT}
+
+    with gr.Blocks(title=title, css=css) as demo:
         gr.Markdown(f"### {title}")
-        image = gr.Image(type="filepath", label="Image", height=480)
+        image = gr.Image(
+            type="filepath",
+            label="Image",
+            height=IMAGE_HEIGHT,
+            elem_id="review-image",
+        )
         caption = gr.Textbox(label="Caption", lines=4)
         progress = gr.Markdown()
         status = gr.Markdown()
@@ -277,7 +303,7 @@ def main():
         server_name="0.0.0.0",
         server_port=args.port,
         share=False,
-        inbrowser=True,
+        inbrowser=False,
         allowed_paths=[DATA_DIR],
     )
 

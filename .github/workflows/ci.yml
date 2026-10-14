@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  powershell:
+    name: PowerShell lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache PowerShell modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/powershell/Modules
+          key: psmodules-${{ runner.os }}-pester5-pssa
+
+      - name: Install PowerShell modules
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          foreach ($m in 'Pester', 'PSScriptAnalyzer') {
+            if (-not (Get-Module -ListAvailable $m)) {
+              Install-Module $m -Scope CurrentUser -Force -SkipPublisherCheck
+            }
+          }
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $findings = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          if ($findings) {
+            $findings | Format-Table RuleName, ScriptName, Line, Message -AutoSize | Out-String -Width 200 | Write-Host
+            throw "PSScriptAnalyzer reported $($findings.Count) finding(s)."
+          }
+          Write-Host 'PSScriptAnalyzer clean.'
+
+      - name: Pester
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0 -Force
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'testresults.xml'
+          Invoke-Pester -Configuration $config
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-results
+          path: testresults.xml
+
+  python:
+    name: Python lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ruff
+        run: pip install ruff==0.6.9
+
+      - name: Compile check
+        run: python -m compileall -q review_ui.py docker/app/florence_api.py
+
+      - name: Ruff
+        run: ruff check review_ui.py docker/app/florence_api.py
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only the review image is built here. The Florence-2 image pulls a
+      # multi-gigabyte CUDA base that does not fit a free CI runner.
+      - name: Build review UI image
+        run: docker build -f docker/Dockerfile.review -t review-ui:ci .
+
+      - name: Validate compose file
+        run: docker compose -f docker/docker-compose.yml config --quiet

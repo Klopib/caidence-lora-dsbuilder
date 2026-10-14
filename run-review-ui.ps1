@@ -1,14 +1,40 @@
-#
-# Run the Gradio review UI in Docker (no host Python/conda needed).
-# Usage:
-#   ./run-review-ui.ps1 -ImageDir "C:\AI\lora-dataset-builder\lora-training\mikey\IMG\12_mikey" -Concept "mikey" -Port 7861
-#
+<#
+.SYNOPSIS
+    Runs the Gradio caption review UI in Docker.
+
+.DESCRIPTION
+    Builds the review image, mounts the dataset at /data and serves the UI.
+    Needs no host Python install. On exit, captions are exported to .txt files
+    ready for kohya_ss.
+
+.PARAMETER ImageDir
+    Dataset folder containing images plus captions.json / captions.csv.
+
+.PARAMETER Concept
+    Trigger word, shown in the UI title.
+
+.PARAMETER RegistryPath
+    Optional shared port registry. Skipped when the file does not exist.
+
+.EXAMPLE
+    ./run-review-ui.ps1 -DatasetDir .\datasets\mikey -Concept mikey
+#>
 
 param(
-  [Parameter(Mandatory = $true)][string]$ImageDir,
+  # The dataset folder: staged images plus captions.json / captions.csv.
+  [Parameter(Mandatory = $true)]
+  [Alias('DatasetDir')]
+  [string]$ImageDir,
+
   [Parameter(Mandatory = $true)][string]$Concept,
   [int]$Port = 7861,
-  [string]$RegistryPath = "C:\AI\.registry.json"
+
+  # Optional shared port registry, for machines that coordinate ports across
+  # several local services. Empty means no registry, which is the default;
+  # set $env:LORA_PORT_REGISTRY to opt in.
+  [string]$RegistryPath = $(
+    if ($env:LORA_PORT_REGISTRY) { $env:LORA_PORT_REGISTRY } else { '' }
+  )
 )
 
 $ExportScript = Join-Path $PSScriptRoot "export-captions.ps1"
@@ -35,7 +61,7 @@ function Stop-ExistingReviewUI {
 
 Stop-ExistingReviewUI -Port $Port
 
-if (Test-Path $RegistryPath) {
+if ($RegistryPath -and (Test-Path $RegistryPath)) {
   try {
     $reg = Get-Content $RegistryPath | ConvertFrom-Json
     $reserved = $reg | Where-Object { $_.port -eq $Port }
@@ -75,7 +101,9 @@ if (Test-Path $RegistryPath) {
     }
   } catch { throw "Port registry error: $_" }
 } else {
-  Write-Host "Registry $RegistryPath not found; skipping reservation check." -ForegroundColor Yellow
+  if ($RegistryPath) {
+    Write-Host "Registry $RegistryPath not found; skipping reservation check." -ForegroundColor Yellow
+  }
 }
 
 $capsJson = Join-Path $ImageDir "captions.json"
@@ -121,4 +149,4 @@ if (-not (Test-Path $ExportScript)) {
   -CaptionsJson $capsJson `
   -Overwrite
 if ($LASTEXITCODE -ne 0) { throw "Export captions failed (exit code $LASTEXITCODE)" }
-Write-Host "  ✓ Captions exported: $ImageDir\*.txt" -ForegroundColor Green
+Write-Host "  [ok] Captions exported: $ImageDir\*.txt" -ForegroundColor Green
