@@ -112,8 +112,8 @@ asymmetric between them, is covered in
 - Somewhere to caption: an Ollama with a vision-capable model. It can be a
   native install, a container, or an instance on another machine — the tool
   just makes HTTP calls to it and does not care how it is hosted.
-- Python 3.10–3.13 for the review UI. A virtual environment is created on first
-  use, so nothing on your system Python changes.
+- Python 3.10 or newer for the review UI. A virtual environment is created on
+  first use, so nothing on your system Python changes.
 
 **Optional:**
 

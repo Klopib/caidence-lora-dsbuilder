@@ -117,20 +117,50 @@ $capsJson = Join-Path $ImageDir "captions.json"
 $capsCsv  = Join-Path $ImageDir "captions.csv"
 if (-not (Test-Path $capsJson) -or -not (Test-Path $capsCsv)) { throw "captions.json / captions.csv not found in $ImageDir. Run caption.ps1 first." }
 
+$script:MinPython = [version]'3.10'
+
 function Find-HostPython {
   <#
     .SYNOPSIS
       Finds a Python suitable for running the review UI.
+
     .DESCRIPTION
-      Newest-tested first. A very new Python is skipped because wheels for it
-      often lag; any of these can install current Gradio.
+      Whatever Python is already on PATH is tried first, so the machine's
+      normal interpreter is used rather than a particular version. Specific
+      versions are only a fallback for when no default is configured.
+
+      The single requirement is 3.10 or newer; current Gradio installs on
+      everything above that, including the newest releases.
   #>
-  foreach ($v in '3.13', '3.12', '3.11', '3.10') {
-    $exe = & py "-$v" -c "import sys; print(sys.executable)" 2>$null
-    if ($LASTEXITCODE -eq 0 -and $exe) { return $exe.Trim() }
+
+  # 'py -3' is the launcher default; 'python' is the PATH default.
+  $candidates = @(
+    @{ Exe = 'py'; Args = @('-3') }
+    @{ Exe = 'python'; Args = @() }
+  )
+  foreach ($v in '3.15', '3.14', '3.13', '3.12', '3.11', '3.10') {
+    $candidates += @{ Exe = 'py'; Args = @("-$v") }
   }
-  $exe = & python -c "import sys; print(sys.executable)" 2>$null
-  if ($LASTEXITCODE -eq 0 -and $exe) { return $exe.Trim() }
+
+  foreach ($c in $candidates) {
+    try {
+      $probe = & $c.Exe @($c.Args + @('-c', 'import sys; print(sys.executable); print("%d.%d" % sys.version_info[:2])')) 2>$null
+    }
+    catch { continue }
+
+    if ($LASTEXITCODE -ne 0 -or -not $probe) { continue }
+
+    $lines = @($probe) | Where-Object { $_ }
+    if ($lines.Count -lt 2) { continue }
+
+    $exe = $lines[0].Trim()
+    $ver = [version]$lines[1].Trim()
+    if ($ver -ge $script:MinPython -and (Test-Path $exe)) {
+      Write-Host "  Using Python $ver" -ForegroundColor DarkGray
+      return $exe
+    }
+  }
+
   return $null
 }
 
@@ -214,8 +244,8 @@ if ($Docker) {
   # no container, which keeps Docker out of the common path entirely.
   $basePython = Find-HostPython
   if (-not $basePython) {
-    throw ("No suitable Python found for the review UI.`n" +
-      "  Install Python 3.10-3.13 from https://python.org, or`n" +
+    throw ("No Python 3.10 or newer found for the review UI.`n" +
+      "  Install Python from https://python.org, or`n" +
       "  re-run with -Docker to use the container instead.")
   }
 
