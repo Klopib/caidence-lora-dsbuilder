@@ -72,21 +72,22 @@ jobs:
         run: pip install ruff==0.6.9
 
       - name: Compile check
-        run: python -m compileall -q review_ui.py docker/app/florence_api.py
+        run: python -m compileall -q review_ui.py lib/prepare_images.py
 
       - name: Ruff
-        run: ruff check review_ui.py docker/app/florence_api.py
+        run: ruff check review_ui.py lib/prepare_images.py
 
   docker:
-    name: Docker build
+    name: App image builds
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      # Only the review image is built here. The Florence-2 image pulls a
-      # multi-gigabyte CUDA base that does not fit a free CI runner.
-      - name: Build review UI image
-        run: docker build -f docker/Dockerfile.review -t review-ui:ci .
+      # The published image is the only use of Docker in this project, so the
+      # one thing worth checking is that it still builds.
+      - name: Build app image
+        run: docker build -t caidence-lora-dsbuilder:ci .
 
-      - name: Validate compose file
-        run: docker compose -f docker/docker-compose.yml config --quiet
+      - name: Smoke test the image
+        run: |
+          docker run --rm caidence-lora-dsbuilder:ci -NoProfile -Command             'python3 -c "import PIL, gradio; print(\"imaging and UI deps present\")"'

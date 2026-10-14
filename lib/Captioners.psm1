@@ -33,9 +33,6 @@ $script:PreamblePattern =
     '|caption\s*:\s*' +
     ')'
 
-# Words indicating a clause is about the setting rather than the subject.
-$script:BackgroundPattern = 'background|backdrop|wall|door|window|room|house|building|tree|sky|floor|ceiling'
-
 
 function Remove-CaptionPreamble {
     <#
@@ -87,122 +84,6 @@ function Convert-ToTags {
     }
 
     return (($tags | Select-Object -Unique) -join ', ')
-}
-
-
-function Set-CaptionSubject {
-    <#
-    .SYNOPSIS
-        Names the training subject once, instead of substituting every pronoun.
-
-    .DESCRIPTION
-        Replaces the FIRST generic subject noun ("a man", "the woman") with the
-        trigger word and leaves later references as ordinary pronouns.
-
-        The previous implementation rewrote every pronoun, producing
-        "mikey is looking at the camera with a smile on mikey's lips" and
-        "mikey appears to be in mikey's late 30s". Repeating the trigger in
-        every clause also teaches the model the phrasing rather than the face.
-    #>
-    [CmdletBinding()]
-    param(
-        [AllowEmptyString()][string]$Caption,
-        [Parameter(Mandatory)][string]$Trigger
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Caption)) { return '' }
-
-    $subject = '(?:young\s+|old\s+|elderly\s+|middle-aged\s+)?(?:man|woman|boy|girl|person|guy|lady|male|female)'
-    $text = $Caption
-
-    # Replaces only the FIRST match. Note [regex]::Replace() has no static
-    # overload taking a count - a 4th argument is read as RegexOptions, so
-    # passing 1 silently means IgnoreCase and replaces every match instead.
-    # $Subject, not $Input: $Input is an automatic variable and binding it
-    # as a parameter silently yields an empty result.
-    $replaceFirst = {
-        param([string]$Subject, [string]$Pattern, [string]$Replacement)
-        $rx = [regex]::new($Pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        $rx.Replace($Subject, $Replacement, 1)
-    }
-
-    # Possessive first: "a man's face" -> "<trigger>'s face".
-    $text = & $replaceFirst $text "\b(?:a|an|the)\s+$subject(?='s\b)" $Trigger
-
-    # Then the plain noun, article included so "The man" does not become "The <trigger>".
-    if ($text -notmatch [regex]::Escape($Trigger)) {
-        $text = & $replaceFirst $text "\b(?:a|an|the)\s+$subject\b" $Trigger
-    }
-
-    # Bare noun with no article, still only the first occurrence.
-    if ($text -notmatch [regex]::Escape($Trigger)) {
-        $text = & $replaceFirst $text "\b$subject\b" $Trigger
-    }
-
-    # Any later "the man" is a repeat mention; a pronoun reads better.
-    $text = $text -replace "(?i)\bthe\s+$subject\b", 'he'
-
-    $text = ($text -replace '\s+', ' ').Trim()
-
-    # Substituting mid-caption can leave a lower-case word opening a sentence
-    # ("... blue t-shirt. he is wearing ..."). Restore sentence capitalisation.
-    $text = [regex]::Replace($text, '(^|[.!?]\s+)(\p{Ll})', {
-            param($m)
-            $m.Groups[1].Value + $m.Groups[2].Value.ToUpperInvariant()
-        })
-
-    # The trigger itself keeps its given spelling even at a sentence start.
-    return [regex]::Replace($text, "(?i)\b$([regex]::Escape($Trigger))\b", $Trigger)
-}
-
-
-function Limit-CaptionContent {
-    <#
-    .SYNOPSIS
-        Drops background detail from a caption when asked to focus on the subject.
-
-    .DESCRIPTION
-        Splits on sentences for prose and on commas for tag-style input, then
-        removes only the clauses that mention the setting.
-
-        The previous implementation always split on commas. A prose caption
-        often contains a single comma, so one background word deleted
-        everything after it - captions were silently truncated mid-sentence
-        ("... <trigger> has short") on every run using the default instruction.
-    #>
-    [CmdletBinding()]
-    param(
-        [AllowEmptyString()][string]$Caption,
-        [AllowEmptyString()][string]$Instruction
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Caption)) { return '' }
-    if ([string]::IsNullOrWhiteSpace($Instruction)) { return $Caption }
-
-    $wantsSubjectFocus = $Instruction -match
-        '(?i)ignore background|less background|no background|focus on (?:the )?(?:subject|person|man|woman)'
-    if (-not $wantsSubjectFocus) { return $Caption }
-
-    # Tag-style input has many commas and no sentence terminators.
-    $isTagStyle = ($Caption -notmatch '[.!?](\s|$)') -and (($Caption -split ',').Count -ge 3)
-
-    if ($isTagStyle) {
-        $parts = $Caption -split ',\s*'
-        $joiner = ', '
-    }
-    else {
-        # Keep the terminator attached to each sentence.
-        $parts = [regex]::Split($Caption, '(?<=[.!?])\s+')
-        $joiner = ' '
-    }
-
-    $kept = @($parts | Where-Object { $_ -and ($_ -notmatch "(?i)$script:BackgroundPattern") })
-
-    # Never return nothing: a caption about only the background still beats an
-    # empty caption, which would silently corrupt the dataset.
-    if ($kept.Count -eq 0) { return $Caption }
-
-    return (($kept -join $joiner) -replace '\s+', ' ').Trim()
 }
 
 
@@ -264,6 +145,7 @@ function Test-CaptionSet {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Captions,
         [ValidateSet('prose', 'tags')][string]$Style = 'prose',
         [string]$ConceptType = 'character',
+        [switch]$VariableAppearance,
         [int]$MinClauses = 4,
         [int]$MaxClauses = 40,
         [int]$MinWords = 8,
@@ -304,8 +186,18 @@ function Test-CaptionSet {
         # a fixed identity trait despite being told not to. Flag it rather than
         # editing the caption - cutting clauses out of generated prose is what
         # produced the truncation bug this validator exists to catch.
+        # Grooming only hurts when it is constant across the set. When it
+        # varies, captioning it is the whole point, so flagging it would tell
+        # the user to delete exactly what they asked for.
+        $traitPattern = if ($VariableAppearance) {
+            '(?i)\b(eye colour|eye color|skin tone|complexion)\b'
+        }
+        else {
+            '(?i)\b(hair|hairstyle|beard|stubble|moustache|mustache|goatee|eye colour|eye color)\b'
+        }
+
         if ($ConceptType -eq 'character') {
-            $trait = [regex]::Match($caption, '(?i)\b(hair|hairstyle|beard|stubble|moustache|mustache|goatee|eye colour|eye color)\b')
+            $trait = [regex]::Match($caption, $traitPattern)
             if ($trait.Success) {
                 $issues.Add([pscustomobject]@{
                         image = $Captions[$i].image
@@ -339,38 +231,92 @@ function Build-CaptionPrompt {
         [Parameter(Mandatory)][string]$Trigger,
         [AllowEmptyString()][string]$Instruction,
         [string]$ConceptType = 'character',
-        [switch]$Tagify
+        [switch]$Tagify,
+
+        # Set when the subject's grooming or build changes across the dataset,
+        # e.g. photos taken over years with different hair or facial hair.
+        # See the LEAVE OUT / DESCRIBE wording below for why it matters.
+        [switch]$VariableAppearance
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
-    $lines.Add('Write a single training caption for an image in a LoRA dataset.')
-    $lines.Add('Rules:')
-    $lines.Add("- Refer to the subject as '$Trigger'.")
+
+    # The objective is stated before the rules, deliberately. A capable model
+    # that understands WHY a detail is excluded can judge the cases this prompt
+    # never enumerates; a blacklist of banned words cannot. Earlier versions
+    # listed "hair, beard, stubble ..." and the model still volunteered "light
+    # five o'clock shadow", which no list would have caught.
+    $lines.Add('You are writing one caption for an image in a LoRA fine-tuning dataset.')
+    $lines.Add('')
+    $lines.Add('How the caption is used, so you can judge what belongs in it:')
+    $lines.Add("every image in this set is tagged '$Trigger'. During training the model")
+    $lines.Add("binds whatever stays CONSTANT across the set to '$Trigger', and treats")
+    $lines.Add('whatever the captions describe as VARIABLE, controllable later by prompt.')
+    $lines.Add('')
+    $lines.Add('So describe what changes from photo to photo, and leave out what does not.')
+    $lines.Add('')
 
     if ($ConceptType -eq 'character') {
-        # Identity traits belong to the trigger token, not the caption. Captioning
-        # them teaches the model they are variable, which dilutes likeness.
-        $lines.Add('- NEVER mention hair, hairstyle, beard, stubble, facial hair, chest hair, face shape, eye colour, skin tone or age. Those are fixed identity traits and must be left out.')
-        $lines.Add('- DO describe pose, expression, clothing, framing, lighting and background.')
+        $lines.Add('DESCRIBE: pose, gaze, expression, clothing and accessories, what the')
+        $lines.Add('subject is doing or holding, framing and crop, camera angle, lighting,')
+        $lines.Add('setting and background.')
+        $lines.Add('')
+        if ($VariableAppearance) {
+            # Grooming that changes between photos has to be captioned. Left
+            # uncaptioned, the same token carries contradictory evidence and
+            # the model averages it, producing facial hair you cannot control.
+            # Captioned, each state becomes promptable.
+            $lines.Add('ALSO DESCRIBE hair length and style, and facial hair, because these')
+            $lines.Add('change across this set. Naming them lets each state be requested later')
+            $lines.Add("('$Trigger with a full beard', '$Trigger clean-shaven'). Leaving them")
+            $lines.Add('out would make the model average the versions together.')
+            $lines.Add('')
+            $lines.Add('LEAVE OUT what never changes: face shape and features, eye colour and')
+            $lines.Add("skin tone. That is the identity '$Trigger' must own.")
+        }
+        else {
+            $lines.Add('LEAVE OUT anything about the person that is the same in every photo:')
+            $lines.Add('face shape and features, hair, facial hair, eye colour, skin tone, build,')
+            $lines.Add("age. That is the identity '$Trigger' must own. Describing it teaches the")
+            $lines.Add('model those traits are optional, which weakens the likeness.')
+        }
     }
     else {
-        $lines.Add("- Describe the $ConceptType itself in concrete visual detail.")
-        $lines.Add('- DO describe shape, colour, material, framing, lighting and background.')
+        $lines.Add("DESCRIBE the $ConceptType itself in concrete visual detail: shape, colour,")
+        $lines.Add('material, construction, condition, plus framing, lighting and setting.')
+        $lines.Add('')
+        $lines.Add('LEAVE OUT anything incidental to it, such as who is wearing or holding it,')
+        $lines.Add('unless that is what varies across the set.')
     }
 
-    $lines.Add('- Describe only what is visible. Never guess at age, mood, names or location.')
-    $lines.Add("- No preamble. Do not begin with 'The image', 'A photo of', 'This picture', '$Trigger is shown' or '$Trigger is captured'. Begin with the subject and what he is doing or wearing.")
+    $lines.Add('')
+    $lines.Add('Accuracy matters more than richness. A confidently wrong detail teaches the')
+    $lines.Add('model something false about the concept. Describe only what you can actually')
+    $lines.Add('see; never guess at age, mood, names, places, or text and brands you cannot')
+    $lines.Add('read clearly. If you are unsure what something is, describe it plainly or')
+    $lines.Add('omit it.')
+    $lines.Add('')
+    $lines.Add('Vary your wording between images. Repeating the same phrasing across the set')
+    $lines.Add('teaches the model the phrasing instead of the subject.')
+    $lines.Add('')
+    $lines.Add('FORMAT:')
+    $lines.Add("- Start with '$Trigger', then what the subject is doing or wearing.")
 
     if ($Tagify) {
-        $lines.Add('- Output lowercase comma-separated tags on one line, no sentences.')
+        $lines.Add('- Lowercase comma-separated tags on one line. No sentences.')
     }
     else {
-        $lines.Add('- Output ONE line of 15 to 40 words. Separate clauses with commas only.')
-        $lines.Add('- Do not use semicolons, full sentences, bullet points or quotes.')
+        $lines.Add('- One line, 15 to 40 words, clauses separated by commas.')
+        $lines.Add('- No full sentences, semicolons, bullet points or quotation marks.')
     }
 
+    $lines.Add("- No preamble: never open with 'The image', 'A photo of', 'This picture',")
+    $lines.Add("  '$Trigger is shown' or '$Trigger is captured'.")
+    $lines.Add('- Output the caption only, with no explanation or commentary.')
+
     if (-not [string]::IsNullOrWhiteSpace($Instruction)) {
-        $lines.Add("- Additional guidance: $Instruction")
+        $lines.Add('')
+        $lines.Add("ALSO: $Instruction")
     }
 
     return ($lines -join "`n")
@@ -489,6 +435,54 @@ function Get-OllamaVisionModel {
 }
 
 
+function Invoke-LocalCaption {
+    <#
+    .SYNOPSIS
+        Captions a batch of images in a local Python process, with no service.
+
+    .DESCRIPTION
+        Runs lib/local_captioner.py, which loads a quantised vision model
+        through llama-cpp-python. The whole batch goes in one call so the model
+        is loaded once rather than per image.
+
+        This is the default provider: it needs no Ollama, no container and no
+        separately installed service, only a one-time model download.
+
+    .OUTPUTS
+        One object per image with image, caption and error.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Paths,
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][string]$PythonExe,
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [string]$Model = 'qwen2.5-vl-3b',
+        [int]$MaxTokens = 160,
+        [double]$Temperature = 0.2
+    )
+
+    $request = @{
+        action      = 'caption'
+        model       = $Model
+        prompt      = $Prompt
+        images      = $Paths
+        max_tokens  = $MaxTokens
+        temperature = $Temperature
+    } | ConvertTo-Json -Depth 5 -Compress
+
+    # Progress is written to stderr by the script, so it shows as it goes while
+    # stdout stays a single JSON document.
+    $response = $request | & $PythonExe $ScriptPath
+    if ($LASTEXITCODE -ne 0) { throw "Local captioner failed (exit $LASTEXITCODE)." }
+
+    $parsed = $response | ConvertFrom-Json
+    if (-not $parsed.ok) { throw "Local captioner error: $($parsed.error)" }
+
+    return $parsed.results
+}
+
+
 function Invoke-OllamaCaption {
     <#
     .SYNOPSIS
@@ -528,37 +522,43 @@ function Invoke-OllamaCaption {
 }
 
 
-function Invoke-FlorenceCaption {
+function ConvertTo-FinalCaption {
     <#
     .SYNOPSIS
-        Captions one image with the Florence-2 API.
+        Turns one raw model response into a finished caption record.
+
+    .DESCRIPTION
+        Shared by every provider, so a caption gets the same treatment whether
+        it came back one at a time or as part of a batch.
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Path,
-        [string]$Task = '<MORE_DETAILED_CAPTION>',
-        [string]$Endpoint = 'http://localhost:8080/caption',
-        [int]$TimeoutSec = 300
+        [Parameter(Mandatory)][string]$Image,
+        [AllowEmptyString()][string]$Raw,
+        [Parameter(Mandatory)][string]$Trigger,
+        [switch]$Tagify
     )
 
-    $form = @{ file = Get-Item -LiteralPath $Path; task = $Task }
-    $response = Invoke-RestMethod -Method Post -Uri $Endpoint -Form $form -TimeoutSec $TimeoutSec
+    $final = Remove-CaptionPreamble -Caption $Raw
+    if ($Tagify) { $final = Convert-ToTags -Caption $final }
 
-    $result = $response.result
-    if ($null -eq $result) { return '' }
-    if ($result -is [string]) { return $result }
-
-    # Florence keys its result by the task token; older builds used 'caption'.
-    foreach ($key in @($Task, 'caption', '<MORE_DETAILED_CAPTION>', '<DETAILED_CAPTION>', '<CAPTION>')) {
-        $prop = $result.PSObject.Properties[$key]
-        if ($prop -and $prop.Value) { return [string]$prop.Value }
+    # Normalise the trigger's spelling. Models capitalise it at the start of a
+    # caption and lower-case it elsewhere; "Mikey" and "mikey" are two
+    # different tokens, so an inconsistent trigger trains the concept onto both.
+    if ($final) {
+        $final = [regex]::Replace($final, "(?i)\b$([regex]::Escape($Trigger))\b", $Trigger)
     }
 
-    # Unknown shape: fall back to the first non-empty property.
-    $first = $result.PSObject.Properties | Where-Object { $_.Value } | Select-Object -First 1
-    if ($first) { return [string]$first.Value }
+    # Guarantee the trigger is present so the token actually trains.
+    if ($final -and $final -notmatch "\b$([regex]::Escape($Trigger))\b") {
+        $final = "$Trigger, $final"
+    }
 
-    return ''
+    return [pscustomobject]@{
+        image         = $Image
+        raw_caption   = ([string]$Raw).Trim()
+        final_caption = ([string]$final).Trim()
+    }
 }
 
 
@@ -574,37 +574,23 @@ function Get-ImageCaption {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Trigger,
-        [ValidateSet('ollama', 'florence')][string]$Provider = 'ollama',
         [AllowEmptyString()][string]$Instruction,
         [string]$ConceptType = 'character',
         [switch]$Tagify,
+        [switch]$VariableAppearance,
         [hashtable]$ProviderOptions = @{}
     )
 
     $raw = ''
     $final = ''
 
-    switch ($Provider) {
-        'ollama' {
-            $prompt = Build-CaptionPrompt -Trigger $Trigger -Instruction $Instruction `
-                -ConceptType $ConceptType -Tagify:$Tagify
-            $raw = Invoke-OllamaCaption -Path $Path -Prompt $prompt @ProviderOptions
+    $prompt = Build-CaptionPrompt -Trigger $Trigger -Instruction $Instruction `
+        -ConceptType $ConceptType -Tagify:$Tagify -VariableAppearance:$VariableAppearance
+    $raw = Invoke-OllamaCaption -Path $Path -Prompt $prompt @ProviderOptions
 
-            # The prompt already enforced the rules; only tidy model chatter.
-            $final = Remove-CaptionPreamble -Caption $raw
-            if ($Tagify) { $final = Convert-ToTags -Caption $final }
-        }
-
-        'florence' {
-            $raw = Invoke-FlorenceCaption -Path $Path @ProviderOptions
-
-            # Florence takes no instructions, so the rules are applied after the fact.
-            $final = Remove-CaptionPreamble -Caption $raw
-            if ($Tagify) { $final = Convert-ToTags -Caption $final }
-            $final = Set-CaptionSubject -Caption $final -Trigger $Trigger
-            $final = Limit-CaptionContent -Caption $final -Instruction $Instruction
-        }
-    }
+    # The prompt already enforced the rules; only tidy model chatter.
+    $final = Remove-CaptionPreamble -Caption $raw
+    if ($Tagify) { $final = Convert-ToTags -Caption $final }
 
     # Normalise the trigger's spelling. Models capitalise it at the start of a
     # caption and lower-case it elsewhere; "Mikey" and "mikey" are two different
@@ -632,12 +618,11 @@ Export-ModuleMember -Function @(
     'Get-OllamaVisionModelList'
     'Remove-CaptionPreamble'
     'Convert-ToTags'
-    'Set-CaptionSubject'
-    'Limit-CaptionContent'
     'Get-CaptionJaccard'
     'Test-CaptionSet'
     'Build-CaptionPrompt'
+    'Invoke-LocalCaption'
     'Invoke-OllamaCaption'
-    'Invoke-FlorenceCaption'
+    'ConvertTo-FinalCaption'
     'Get-ImageCaption'
 )

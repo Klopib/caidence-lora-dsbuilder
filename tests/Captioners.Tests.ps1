@@ -20,8 +20,7 @@ BeforeAll {
     "The background is a plain white wall with a door visible on the left side. " +
     "The man is wearing a light blue t-shirt."
 
-    $script:SubjectFocus = 'focus on the subject; ignore background objects'
-}
+    }
 
 Describe 'Remove-CaptionPreamble' {
 
@@ -51,103 +50,6 @@ Describe 'Remove-CaptionPreamble' {
     It 'returns empty string for null or whitespace input' {
         Remove-CaptionPreamble -Caption '' | Should -Be ''
         Remove-CaptionPreamble -Caption '   ' | Should -Be ''
-    }
-}
-
-Describe 'Set-CaptionSubject' {
-
-    It 'names the subject on its first mention' {
-        $result = Set-CaptionSubject -Caption "a man's face, smiling" -Trigger 'mikey'
-        $result | Should -Match "^mikey's face"
-    }
-
-    It 'REGRESSION: does not rewrite possessive pronouns into the trigger' {
-        # Old behaviour produced "mikey appears to be in mikey's late 30s".
-        $result = Set-CaptionSubject -Caption $script:FlorenceSample -Trigger 'mikey'
-        $result | Should -Not -Match "mikey's late 30s"
-        $result | Should -Not -Match "on mikey's lips"
-    }
-
-    It 'REGRESSION: does not leave a dangling article ("The mikey")' {
-        $result = Set-CaptionSubject -Caption 'The man is wearing a blue shirt' -Trigger 'mikey'
-        $result | Should -Not -Match '(?i)the mikey'
-        $result | Should -Match '^mikey is wearing'
-    }
-
-    It 'mentions the trigger exactly once for a multi-sentence caption' {
-        $result = Set-CaptionSubject -Caption $script:FlorenceSample -Trigger 'mikey'
-        ([regex]::Matches($result, '(?i)\bmikey\b')).Count | Should -Be 1
-    }
-
-    It 'handles a bare subject noun with no article' {
-        Set-CaptionSubject -Caption 'man riding a bike' -Trigger 'mikey' |
-            Should -Match '^mikey riding'
-    }
-
-    It 'capitalises a sentence that substitution left starting lower-case' {
-        # "... t-shirt. The man is wearing ..." becomes "... t-shirt. He is wearing ..."
-        $result = Set-CaptionSubject -Caption 'A man smiles. The man is wearing a blue t-shirt.' -Trigger 'mikey'
-        $result | Should -Match 'smiles\. He is wearing'
-    }
-
-    It 'keeps the trigger spelling even when it opens a sentence' {
-        $result = Set-CaptionSubject -Caption 'a man smiles.' -Trigger 'mikey'
-        ($result -cmatch 'Mikey') | Should -BeFalse
-        $result | Should -Match '^mikey'
-    }
-
-    It 'leaves a caption with no subject noun untouched' {
-        Set-CaptionSubject -Caption 'a red sports car on a track' -Trigger 'mikey' |
-            Should -Be 'a red sports car on a track'
-    }
-
-    It 'returns empty string for empty input' {
-        Set-CaptionSubject -Caption '' -Trigger 'mikey' | Should -Be ''
-    }
-}
-
-Describe 'Limit-CaptionContent' {
-
-    It 'REGRESSION: does not truncate a prose caption at the first comma' {
-        # The shipped version returned "... mikey has short", deleting clothing,
-        # pose and everything else after the first background-bearing chunk.
-        $named = Set-CaptionSubject -Caption $script:FlorenceSample -Trigger 'mikey'
-        $result = Limit-CaptionContent -Caption $named -Instruction $script:SubjectFocus
-
-        $result | Should -Match '(?i)light blue t-shirt'
-        $result | Should -Not -Match '(?i)has short$'
-    }
-
-    It 'drops the sentence describing the background' {
-        $named = Set-CaptionSubject -Caption $script:FlorenceSample -Trigger 'mikey'
-        $result = Limit-CaptionContent -Caption $named -Instruction $script:SubjectFocus
-
-        $result | Should -Not -Match '(?i)plain white wall'
-    }
-
-    It 'drops only background clauses from tag-style input' {
-        $tags = 'mikey, blue t-shirt, smiling, plain white wall, soft lighting'
-        $result = Limit-CaptionContent -Caption $tags -Instruction $script:SubjectFocus
-
-        $result | Should -Be 'mikey, blue t-shirt, smiling, soft lighting'
-    }
-
-    It 'leaves the caption alone when no instruction is given' {
-        Limit-CaptionContent -Caption $script:FlorenceSample -Instruction '' |
-            Should -Be $script:FlorenceSample
-    }
-
-    It 'leaves the caption alone for an unrelated instruction' {
-        Limit-CaptionContent -Caption $script:FlorenceSample -Instruction 'use british spelling' |
-            Should -Be $script:FlorenceSample
-    }
-
-    It 'never returns empty, even when every clause mentions the background' {
-        $allBackground = 'a plain white wall, a wooden door, a bright window'
-        $result = Limit-CaptionContent -Caption $allBackground -Instruction $script:SubjectFocus
-
-        $result | Should -Not -BeNullOrEmpty
-        $result | Should -Be $allBackground
     }
 }
 
@@ -260,6 +162,18 @@ Describe 'Test-CaptionSet' {
         @($issues | Where-Object { $_.issue -match 'identity trait' }).Count | Should -Be 1
     }
 
+    It 'does not flag hair when appearance is declared variable' {
+        # With -VariableAppearance the trait is wanted, so flagging it would be
+        # telling the user to remove exactly what they asked for.
+        $set = @([pscustomobject]@{
+                image         = 'a.jpg'
+                final_caption = 'mikey in a black shirt with a full beard, seated indoors, warm light'
+            })
+        $issues = Test-CaptionSet -Captions $set -ConceptType 'character' -VariableAppearance
+
+        @($issues | Where-Object { $_.issue -match 'identity trait' }).Count | Should -Be 0
+    }
+
     It 'does not flag identity traits for non-character concepts' {
         $set = @([pscustomobject]@{
                 image         = 'a.jpg'
@@ -287,7 +201,7 @@ Describe 'Get-ImageCaption' {
             'Mikey sits in a car, mikey wears a black hoodie'
         }
 
-        $result = Get-ImageCaption -Path $script:FakeImage -Trigger 'mikey' -Provider 'ollama'
+        $result = Get-ImageCaption -Path $script:FakeImage -Trigger 'mikey'
 
         # -Match is case-insensitive in Pester, so compare case-sensitively here.
         ($result.final_caption -cmatch 'Mikey') | Should -BeFalse
@@ -299,7 +213,7 @@ Describe 'Get-ImageCaption' {
             'a blue t-shirt, standing indoors, soft lighting'
         }
 
-        $result = Get-ImageCaption -Path $script:FakeImage -Trigger 'mikey' -Provider 'ollama'
+        $result = Get-ImageCaption -Path $script:FakeImage -Trigger 'mikey'
         $result.final_caption | Should -Match '^mikey, '
     }
 
@@ -308,24 +222,13 @@ Describe 'Get-ImageCaption' {
             'The image shows mikey standing outdoors in a red coat'
         }
 
-        $result = Get-ImageCaption -Path $script:FakeImage -Trigger 'mikey' -Provider 'ollama'
+        $result = Get-ImageCaption -Path $script:FakeImage -Trigger 'mikey'
 
         $result.raw_caption | Should -Match '^The image shows'
         $result.final_caption | Should -Not -Match '^The image shows'
         $result.image | Should -Be $script:FakeImage
     }
 
-    It 'applies Florence post-processing only on the florence provider' {
-        Mock -ModuleName Captioners Invoke-FlorenceCaption {
-            "The image is a photo of a man's face. The background is a white wall."
-        }
-
-        $result = Get-ImageCaption -Path $script:FakeImage -Trigger 'mikey' `
-            -Provider 'florence' -Instruction 'ignore background objects'
-
-        $result.final_caption | Should -Match "^mikey's face"
-        $result.final_caption | Should -Not -Match '(?i)white wall'
-    }
 }
 
 Describe 'Get-OllamaVisionModel' {
@@ -459,17 +362,18 @@ Describe 'Build-CaptionPrompt' {
 
     It 'tells a character model to skip fixed identity traits' {
         $prompt = Build-CaptionPrompt -Trigger 'mikey' -Instruction '' -ConceptType 'character'
-        $prompt | Should -Match '(?i)fixed identity traits'
-        # Hair and stubble leaked into real captions until the prompt named them.
+        # The prompt explains WHY a trait is excluded rather than listing banned
+        # words, so the model can judge cases the prompt never enumerates.
+        $prompt | Should -Match '(?i)LEAVE OUT'
+        $prompt | Should -Match '(?i)identity'
         $prompt | Should -Match '(?i)hair'
-        $prompt | Should -Match '(?i)stubble'
     }
 
     It 'forbids semicolons so clause counting stays accurate' {
         # Semicolon-joined prose made rich captions look like 2-clause captions
         # to the validator, producing false "Clause count" flags.
         Build-CaptionPrompt -Trigger 'mikey' -Instruction '' |
-            Should -Match '(?i)do not use semicolons'
+            Should -Match '(?i)semicolons'
     }
 
     It 'describes the object itself for non-character concepts' {
@@ -486,6 +390,21 @@ Describe 'Build-CaptionPrompt' {
     It 'appends caller guidance when an instruction is supplied' {
         Build-CaptionPrompt -Trigger 'mikey' -Instruction 'prefer short captions' |
             Should -Match 'prefer short captions'
+    }
+
+    It 'describes hair and facial hair when they vary across the set' {
+        # Captioning a trait that changes is what makes it promptable later;
+        # omitting it makes the model average the versions together.
+        $prompt = Build-CaptionPrompt -Trigger 'mikey' -Instruction '' -VariableAppearance
+        $prompt | Should -Match '(?i)ALSO DESCRIBE'
+        $prompt | Should -Match '(?i)facial hair'
+        $prompt | Should -Match '(?i)clean-shaven'
+    }
+
+    It 'still excludes what never changes, even when appearance varies' {
+        $prompt = Build-CaptionPrompt -Trigger 'mikey' -Instruction '' -VariableAppearance
+        $prompt | Should -Match '(?i)LEAVE OUT what never changes'
+        $prompt | Should -Match '(?i)eye colour'
     }
 
     It 'always forbids a preamble' {

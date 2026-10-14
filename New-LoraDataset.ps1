@@ -36,15 +36,18 @@ param(
     [string]$Instruction = "",
 
     # Captioning backend. 'ollama' follows instructions, so it needs no
-    # post-processing; 'florence' is the offline fallback.
-    [ValidateSet("ollama", "florence")]
-    [string]$Provider = "ollama",
+    # 'local' captions here and needs nothing installed; 'ollama' reuses one
+    # you already run.
+    [ValidateSet("local", "ollama")]
+    [string]$Provider = "local",
 
-    # Blank means auto-select an installed vision-capable model.
+    # Model for -Provider local. See lib/local_captioner.py for the list.
+    [string]$LocalModel = "qwen2.5-vl-3b",
+
+    # For -Provider ollama. Blank means auto-select a vision-capable model.
     [string]$Model = "",
 
     [string]$OllamaEndpoint = "http://localhost:11434",
-    [string]$FlorenceEndpoint = "http://localhost:8080",
 
     # Port for the caption review UI.
     [int]$ReviewPort = 7861,
@@ -52,6 +55,9 @@ param(
     # Comma-separated tags instead of prose. Tag captions suit booru-style base
     # models (Pony, Illustrious); prose suits newer ones (Flux, SDXL).
     [switch]$Tagify,
+
+    # Set when the subject's hair or facial hair changes across the photos.
+    [switch]$VariableAppearance,
 
     # Accept the default answer to every confirmation prompt and run unattended.
     # Requires the values that have no default to be passed as parameters:
@@ -80,6 +86,15 @@ $ErrorActionPreference = "Stop"
 $script:AcceptDefaults = [bool]$Yes
 
 Import-Module (Join-Path $PSScriptRoot 'lib/Captioners.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'lib/PythonEnv.psm1') -Force
+
+# Pillow prepares the images and Gradio runs the review UI. Both live in one
+# environment under the repo, created on first run; the system Python is never
+# touched. Done here so a missing Python is reported before anything else.
+$script:PythonExe = Initialize-PythonEnv `
+    -VenvPath (Join-Path $PSScriptRoot '.venv') `
+    -Packages @('pillow', 'gradio') `
+    -ImportNames @('PIL', 'gradio')
 
 # Any terminating error used to end the script instantly. Launched from an
 # icon or a transient terminal, that closed the window before the reason could
@@ -108,6 +123,38 @@ function Read-StringValue {
     return $val.Trim()
 }
 
+function Get-LocalModelChoice {
+    <#
+    .SYNOPSIS
+        Lists the vision models the local captioner can download.
+    .DESCRIPTION
+        The list lives in lib/local_captioner.py beside the download logic, so
+        there is one place to add a model rather than two that can disagree.
+    .OUTPUTS
+        Objects with key, label, size_gb and note. Empty if the list cannot be read.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$PythonExe,
+        [Parameter(Mandatory)][string]$RepoRoot
+    )
+
+    $script = Join-Path $RepoRoot 'lib/local_captioner.py'
+    if (-not (Test-Path -LiteralPath $script)) { return @() }
+
+    try {
+        $response = (@{ action = 'models' } | ConvertTo-Json -Compress) | & $PythonExe $script
+        if ($LASTEXITCODE -ne 0) { return @() }
+        $parsed = $response | ConvertFrom-Json
+        if (-not $parsed.ok) { return @() }
+        return @($parsed.models)
+    }
+    catch {
+        # A missing list is not fatal: the default model still downloads.
+        return @()
+    }
+}
+
+
 function Test-OllamaBackend {
     <#
     .SYNOPSIS
@@ -125,8 +172,8 @@ function Test-OllamaBackend {
             Ok     = $false
             Models = @()
             Reason = "Cannot reach Ollama at $Endpoint.`n" +
-            "    Start it with: docker start ollama`n" +
-            "    Or launch Ollama for Windows, then try again."
+            "    Install it from https://ollama.com and make sure it is running.`n" +
+            "    Then try again."
         }
     }
 
@@ -137,100 +184,11 @@ function Test-OllamaBackend {
             Models = @()
             Reason = "Ollama is running but has no model that can accept images.`n" +
             "    Pull one, for example: ollama pull qwen3.5`n" +
-            "    Then try again, or switch to Florence-2."
+            "    Install it from https://ollama.com, then try again."
         }
     }
 
     return @{ Ok = $true; Models = $models; Reason = '' }
-}
-
-
-function Test-FlorenceBackend {
-    <#
-    .SYNOPSIS
-        Checks that the Florence-2 API is serving, optionally starting it.
-    .OUTPUTS
-        Hashtable with Ok and Reason.
-    #>
-    param(
-        [string]$Endpoint,
-        [string]$StartScript,
-        [bool]$MayStart = $true
-    )
-
-    $probe = {
-        try {
-            $h = Invoke-RestMethod -Method Get -Uri "$Endpoint/health" -TimeoutSec 5
-            return [bool]($h.status -eq 'ok')
-        }
-        catch { return $false }
-    }
-
-    if (& $probe) { return @{ Ok = $true; Reason = '' } }
-
-    if (-not $MayStart) {
-        return @{ Ok = $false; Reason = "Florence-2 is not responding at $Endpoint." }
-    }
-
-    Write-Host "  Florence-2 is not running." -ForegroundColor Yellow
-    Write-Host "  Starting it takes about 30s, and the first run downloads ~1.5GB of weights." -ForegroundColor DarkGray
-    if (-not (Read-YesNo "  Start Florence-2 now?" -Default $true)) {
-        return @{ Ok = $false; Reason = 'Florence-2 was not started.' }
-    }
-
-    if (-not (Test-Path $StartScript)) {
-        return @{ Ok = $false; Reason = "start.ps1 not found at $StartScript" }
-    }
-
-    Write-Host "  Starting Florence-2 ..." -ForegroundColor Cyan
-    & pwsh -NoProfile -File $StartScript -Wait
-    if ($LASTEXITCODE -ne 0) {
-        return @{ Ok = $false; Reason = "Florence-2 failed to start (exit code $LASTEXITCODE). Check scripts/logs.ps1" }
-    }
-
-    if (& $probe) { return @{ Ok = $true; Reason = '' } }
-    return @{ Ok = $false; Reason = "Florence-2 started but is not reporting healthy at $Endpoint." }
-}
-
-
-function Invoke-CaptionerSetup {
-    <#
-    .SYNOPSIS
-        Runs setup-captioner.ps1 and reports the endpoint it ended up on.
-    .DESCRIPTION
-        The setup script may settle on a port other than the default when the
-        usual one is taken by something that is not Ollama, so the endpoint is
-        rediscovered afterwards rather than assumed.
-    .OUTPUTS
-        The endpoint URL, or $null when setup did not produce a usable backend.
-    #>
-    param(
-        [string]$ScriptPath,
-        [string]$PreferredEndpoint
-    )
-
-    if (-not (Test-Path $ScriptPath)) {
-        throw "setup-captioner.ps1 not found at $ScriptPath"
-    }
-
-    & pwsh -NoProfile -File $ScriptPath
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "  Captioner setup did not complete." -ForegroundColor Yellow
-        return $null
-    }
-
-    if ((Test-OllamaBackend -Endpoint $PreferredEndpoint).Ok) { return $PreferredEndpoint }
-
-    foreach ($p in 11434..11440) {
-        $candidate = "http://localhost:$p"
-        if ($candidate -eq $PreferredEndpoint) { continue }
-        if ((Test-OllamaBackend -Endpoint $candidate).Ok) {
-            Write-Host "  Using captioner at $candidate" -ForegroundColor Cyan
-            return $candidate
-        }
-    }
-
-    return $null
 }
 
 
@@ -296,124 +254,58 @@ function Read-ResizeLongEdge {
     }
 }
 
-function Copy-ImageWithOptionalResize {
+function Invoke-ImagePreparation {
+    <#
+    .SYNOPSIS
+        Copies, orients and resizes a batch of images.
+
+    .DESCRIPTION
+        Hands the work to lib/prepare_images.py, which uses Pillow. That library
+        applies EXIF orientation and is available on every platform, unlike
+        System.Drawing, which is Windows-only in .NET 6+ and silently wrote
+        rotated photos out sideways.
+
+        The whole batch goes in one call, so Python starts once per run rather
+        than once per image.
+
+    .OUTPUTS
+        One object per image with Source, Status, Width, Height and Error.
+    #>
     param(
-        [string]$SourcePath,
-        [string]$DestinationPath,
-        [int]$LongEdgeTarget
+        [Parameter(Mandatory)][object[]]$Jobs,
+        [Parameter(Mandatory)][string]$PythonExe,
+        [int]$JpegQuality = 95
     )
 
-    if (-not $script:SystemDrawingLoaded) {
-        Add-Type -AssemblyName System.Drawing
-        $script:SystemDrawingLoaded = $true
-    }
+    $script = Join-Path $PSScriptRoot 'lib/prepare_images.py'
+    if (-not (Test-Path -LiteralPath $script)) { throw "prepare_images.py not found at $script" }
 
-    $destExt = [System.IO.Path]::GetExtension($DestinationPath).ToLowerInvariant()
-    $isJpegDest = $destExt -in @('.jpg', '.jpeg')
+    $request = @{ jobs = $Jobs; jpeg_quality = $JpegQuality } | ConvertTo-Json -Depth 5 -Compress
+    $response = $request | & $PythonExe $script
+    if ($LASTEXITCODE -ne 0) { throw "Image preparation failed (exit $LASTEXITCODE)." }
 
-    # Helper: save bitmap with appropriate encoder
-    function Save-Bitmap {
-        param($Bitmap, $Path)
-        $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
-        if ($ext -in @('.jpg', '.jpeg')) {
-            $encoder = [System.Drawing.Imaging.Encoder]::Quality
-            $encoderParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
-            $encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter($encoder, 95L)
-            $jpegCodec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
-                Where-Object { $_.MimeType -eq 'image/jpeg' } |
-                Select-Object -First 1
-            $Bitmap.Save($Path, $jpegCodec, $encoderParams)
-        } elseif ($ext -eq '.png') {
-            $Bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
-        } else {
-            $Bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Bmp)
-        }
-    }
-
-    $sourceImage = $null
-    $resizedBitmap = $null
-    $graphics = $null
-
-    try {
-        $sourceImage = [System.Drawing.Image]::FromFile($SourcePath)
-
-        # Phone cameras store a photo in sensor orientation and record how to
-        # rotate it in EXIF tag 274. System.Drawing neither applies that tag nor
-        # carries it into a saved bitmap, so a resized portrait would be written
-        # sideways and train the model on rotated images.
-        $orientation = 1
-        if ($sourceImage.PropertyIdList -contains 274) {
-            $orientation = [BitConverter]::ToUInt16($sourceImage.GetPropertyItem(274).Value, 0)
-        }
-
-        if ($orientation -ne 1) {
-            $rotate = switch ($orientation) {
-                2 { [System.Drawing.RotateFlipType]::RotateNoneFlipX }
-                3 { [System.Drawing.RotateFlipType]::Rotate180FlipNone }
-                4 { [System.Drawing.RotateFlipType]::Rotate180FlipX }
-                5 { [System.Drawing.RotateFlipType]::Rotate90FlipX }
-                6 { [System.Drawing.RotateFlipType]::Rotate90FlipNone }
-                7 { [System.Drawing.RotateFlipType]::Rotate270FlipX }
-                8 { [System.Drawing.RotateFlipType]::Rotate270FlipNone }
-                default { $null }
-            }
-            if ($rotate) {
-                $sourceImage.RotateFlip($rotate)
-                # The pixels now match what the tag described; leaving the tag in
-                # place would make a viewer rotate the image a second time.
-                $sourceImage.RemovePropertyItem(274)
-            }
-        }
-
-        $currentLongEdge = [Math]::Max($sourceImage.Width, $sourceImage.Height)
-
-        # No resize needed - but the file may still need re-encoding, either to
-        # change format or to bake in the rotation handled above. Trainers read
-        # images with PIL, which ignores EXIF orientation, so a rotated photo
-        # copied verbatim would be trained on sideways.
-        if ($LongEdgeTarget -le 0 -or $currentLongEdge -le $LongEdgeTarget) {
-            $sourceExt = [System.IO.Path]::GetExtension($SourcePath).ToLowerInvariant()
-            $needsReencode = ($orientation -ne 1) -or ($isJpegDest -and $sourceExt -notin @('.jpg', '.jpeg'))
-
-            if ($needsReencode) {
-                $bitmap = New-Object System.Drawing.Bitmap($sourceImage)
-                try { Save-Bitmap $bitmap $DestinationPath }
-                finally { $bitmap.Dispose() }
-                return $(if ($orientation -ne 1) { "Rotated" } else { "CopiedNoResizeNeeded" })
-            }
-
-            $sourceImage.Dispose()
-            $sourceImage = $null
-            Copy-Item -Path $SourcePath -Destination $DestinationPath -Force
-            return "CopiedNoResizeNeeded"
-        }
-
-        $scale = [double]$LongEdgeTarget / [double]$currentLongEdge
-        $newWidth  = [Math]::Max(1, [int][Math]::Round($sourceImage.Width  * $scale))
-        $newHeight = [Math]::Max(1, [int][Math]::Round($sourceImage.Height * $scale))
-
-        $resizedBitmap = New-Object System.Drawing.Bitmap($newWidth, $newHeight)
-        $graphics = [System.Drawing.Graphics]::FromImage($resizedBitmap)
-        $graphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
-        $graphics.InterpolationMode  = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-        $graphics.SmoothingMode      = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
-        $graphics.PixelOffsetMode    = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-        $graphics.DrawImage($sourceImage, 0, 0, $newWidth, $newHeight)
-
-        Save-Bitmap $resizedBitmap $DestinationPath
-        return "Resized"
-    }
-    catch {
-        if ($sourceImage) { $sourceImage.Dispose(); $sourceImage = $null }
-        Copy-Item -Path $SourcePath -Destination $DestinationPath -Force
-        return "CopiedResizeFailed"
-    }
-    finally {
-        if ($graphics)      { $graphics.Dispose() }
-        if ($resizedBitmap) { $resizedBitmap.Dispose() }
-        if ($sourceImage)   { $sourceImage.Dispose() }
-    }
+    return (($response | ConvertFrom-Json).results)
 }
+
+
+function Get-ImageDimension {
+    <#
+    .SYNOPSIS
+        Reports image sizes as a viewer would show them, EXIF rotation applied.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$Paths,
+        [Parameter(Mandatory)][string]$PythonExe
+    )
+
+    $script = Join-Path $PSScriptRoot 'lib/prepare_images.py'
+    $request = @{ probe = $Paths } | ConvertTo-Json -Depth 3 -Compress
+    $response = $request | & $PythonExe $script
+    if ($LASTEXITCODE -ne 0) { return @() }
+
+    return (($response | ConvertFrom-Json).results)
+}
+
 
 function Show-TrainingRateInfo {
     Write-Host ""
@@ -481,17 +373,14 @@ function Get-ImageAnalysis {
         return $null
     }
     
-    # Load first image to check dimensions
-    try {
-        Add-Type -AssemblyName System.Drawing
-        $firstImg = [System.Drawing.Image]::FromFile($imageFiles[0].FullName)
-        $avgWidth = $firstImg.Width
-        $avgHeight = $firstImg.Height
-        $firstImg.Dispose()
-    }
-    catch {
-        $avgWidth = "Unknown"
-        $avgHeight = "Unknown"
+    # Sample resolution, as a viewer would show it: EXIF-rotated photos report
+    # their stored size otherwise, which reads as landscape for a portrait shot.
+    $avgWidth = "Unknown"
+    $avgHeight = "Unknown"
+    $probe = Get-ImageDimension -Paths @($imageFiles[0].FullName) -PythonExe $script:PythonExe
+    if ($probe -and $probe[0].width -gt 0) {
+        $avgWidth = $probe[0].width
+        $avgHeight = $probe[0].height
     }
     
     return [PSCustomObject]@{
@@ -703,35 +592,89 @@ Write-Host "  [ok] Total training steps per epoch: $totalSteps" -ForegroundColor
 
 # --- Step 6b: Captioning backend --------------------------------------------
 
-# Detection first, then a question about what was found. Asking someone to
-# choose a backend before telling them what is installed makes them guess.
+# Captioning here is the default, because it works for someone who has
+# installed nothing beyond this tool. An Ollama is only offered when one is
+# actually running, so the common path is a single confirmation.
 Write-Host ""
 Write-Host "Captioning" -ForegroundColor White
-Write-Host "  Checking what is available ..." -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  This tool can caption on its own. It downloads a vision model once" -ForegroundColor DarkGray
+Write-Host "  and runs it here: no other software, no account, nothing to configure." -ForegroundColor DarkGray
+
+if (-not $script:PythonExe) {
+    $script:PythonExe = Initialize-PythonEnv `
+        -VenvPath (Join-Path $PSScriptRoot '.venv') `
+        -Packages @('pillow', 'huggingface_hub') `
+        -ImportNames @('PIL', 'huggingface_hub')
+}
+
+$ollama = Test-OllamaBackend -Endpoint $OllamaEndpoint
+if ($ollama.Ok) {
+    Write-Host ""
+    Write-Host "  You also have Ollama running at $OllamaEndpoint" -ForegroundColor DarkGray
+    Write-Host "    with: $($ollama.Models -join ', ')" -ForegroundColor DarkGray
+}
 
 $backendReady = $false
 
 while (-not $backendReady) {
 
-    $ollama = Test-OllamaBackend -Endpoint $OllamaEndpoint
+    Write-Host ""
+    Write-Host "How should captions be generated?" -ForegroundColor White
+    Write-Host "  1. Here, in this tool  (recommended) downloads a model the first time" -ForegroundColor DarkGray
 
-    if ($ollama.Ok -and $Provider -eq 'ollama') {
-        Write-Host ""
-        Write-Host "  Found Ollama at $OllamaEndpoint" -ForegroundColor Green
-        Write-Host "    Vision-capable models: $($ollama.Models -join ', ')" -ForegroundColor DarkGray
-        Write-Host ""
+    $maxChoice = 1
+    if ($ollama.Ok) {
+        $maxChoice = 2
+        Write-Host "  2. Use your Ollama     reuses a model you already have" -ForegroundColor DarkGray
+    }
 
-        if (Read-YesNo "Use Ollama for captioning?" -Default $true) {
+    $cancelChoice = $maxChoice + 1
+    Write-Host "  $cancelChoice. Cancel" -ForegroundColor DarkGray
+    Write-Host ""
+
+    switch (Read-IntValue "Choice (1-$cancelChoice)" -Min 1 -Max $cancelChoice -Default 1) {
+
+        1 {
+            $Provider = 'local'
+
+            if (-not $script:AcceptDefaults) {
+                $choices = Get-LocalModelChoice -PythonExe $script:PythonExe -RepoRoot $PSScriptRoot
+                if ($choices.Count -gt 1) {
+                    Write-Host ""
+                    Write-Host "Which model?" -ForegroundColor White
+                    for ($i = 0; $i -lt $choices.Count; $i++) {
+                        $c = $choices[$i]
+                        $mark = if ($c.key -eq $LocalModel) { ' (default)' } else { '' }
+                        Write-Host ("  {0}. {1,-16} {2,5:N1} GB  {3}{4}" -f ($i + 1), $c.label, $c.size_gb, $c.note, $mark) -ForegroundColor DarkGray
+                    }
+                    Write-Host ""
+                    Write-Host "  Downloaded once and reused. Larger models caption better but run slower." -ForegroundColor DarkGray
+                    Write-Host ""
+
+                    $default = 1
+                    for ($i = 0; $i -lt $choices.Count; $i++) {
+                        if ($choices[$i].key -eq $LocalModel) { $default = $i + 1 }
+                    }
+                    $pick = Read-IntValue "Choice (1-$($choices.Count))" -Min 1 -Max $choices.Count -Default $default
+                    $LocalModel = $choices[$pick - 1].key
+                }
+            }
+
+            $backendReady = $true
+        }
+
+        2 {
             $Provider = 'ollama'
 
             if ($Model -and ($ollama.Models -notcontains $Model)) {
-                Write-Host "  '$Model' cannot accept images; choose from the list below." -ForegroundColor Yellow
+                Write-Host "  '$Model' cannot accept images; choosing automatically." -ForegroundColor Yellow
                 $Model = ''
             }
 
             if (-not $Model -and -not $script:AcceptDefaults -and $ollama.Models.Count -gt 1) {
                 Write-Host ""
-                Write-Host "Which model?" -ForegroundColor White
+                Write-Host "Which Ollama model?" -ForegroundColor White
                 Write-Host "  1. Auto-select (recommended)" -ForegroundColor DarkGray
                 for ($i = 0; $i -lt $ollama.Models.Count; $i++) {
                     Write-Host "  $($i + 2). $($ollama.Models[$i])" -ForegroundColor DarkGray
@@ -742,70 +685,9 @@ while (-not $backendReady) {
             }
 
             $backendReady = $true
-            continue
         }
 
-        # Declined the Ollama that was found; fall through to the menu.
-        Write-Host ""
-    }
-    elseif ($Provider -eq 'ollama') {
-        Write-Host ""
-        # Reason already names the endpoint and carries its own indent.
-        Write-Host "  $($ollama.Reason)" -ForegroundColor Yellow
-        Write-Host ""
-    }
-
-    if ($script:AcceptDefaults) {
-        throw "No working captioning backend. Resolve the above and re-run."
-    }
-
-    Write-Host "How would you like to caption?" -ForegroundColor White
-    Write-Host "  1. Set one up here   downloads a vision model and runs it, needs only Docker" -ForegroundColor DarkGray
-    Write-Host "  2. Florence-2        self-contained container, no model pull, lower quality" -ForegroundColor DarkGray
-    Write-Host "  3. Use a different Ollama address" -ForegroundColor DarkGray
-    Write-Host "  4. Retry             after starting Ollama in another window" -ForegroundColor DarkGray
-    Write-Host "  5. Cancel" -ForegroundColor DarkGray
-    Write-Host ""
-
-    switch (Read-IntValue "Choice (1-5)" -Min 1 -Max 5 -Default 1) {
-
-        1 {
-            $resolved = Invoke-CaptionerSetup -ScriptPath (Join-Path $ScriptsDir 'setup-captioner.ps1') `
-                -PreferredEndpoint $OllamaEndpoint
-            $Provider = 'ollama'
-            $Model = ''
-            if ($resolved) { $OllamaEndpoint = $resolved }
-        }
-
-        2 {
-            $florence = Test-FlorenceBackend -Endpoint $FlorenceEndpoint `
-                -StartScript (Join-Path $ScriptsDir 'start.ps1') -MayStart $true
-            if ($florence.Ok) {
-                Write-Host "  [ok] Florence-2 responding at $FlorenceEndpoint" -ForegroundColor Green
-                $Provider = 'florence'
-                $Model = ''
-                $backendReady = $true
-            }
-            else {
-                Write-Host ""
-                Write-Host "  Florence-2 unavailable: $($florence.Reason)" -ForegroundColor Red
-                Write-Host ""
-            }
-        }
-
-        3 {
-            $addr = (Read-Host "Ollama address [$OllamaEndpoint]").Trim()
-            if ($addr) {
-                if ($addr -notmatch '^https?://') { $addr = "http://$addr" }
-                $OllamaEndpoint = $addr
-            }
-            $Provider = 'ollama'
-            $Model = ''
-        }
-
-        4 { $Provider = 'ollama' }
-
-        5 {
+        default {
             Write-Host ""
             Write-Host "Cancelled. No files were created." -ForegroundColor Yellow
             Write-Host ""
@@ -813,15 +695,13 @@ while (-not $backendReady) {
             exit 1
         }
     }
-
-    Write-Host ""
 }
 
 # --- Step 6c: Caption style and guidance ------------------------------------
 
 Write-Host ""
 Write-Host "Caption settings" -ForegroundColor White
-Write-Host "  Backend:   $Provider$(if ($Provider -eq 'ollama') { " ($OllamaEndpoint)" })" -ForegroundColor DarkGray
+Write-Host "  Backend:   Ollama ($OllamaEndpoint)" -ForegroundColor DarkGray
 Write-Host "  Model:     $(if ($Model) { $Model } else { 'auto-select' })" -ForegroundColor DarkGray
 Write-Host "  Style:     $(if ($Tagify) { 'comma-separated tags' } else { 'prose clauses' })" -ForegroundColor DarkGray
 Write-Host "  Guidance:  $(if ($Instruction) { $Instruction } else { 'none' })" -ForegroundColor DarkGray
@@ -835,6 +715,16 @@ if (-not $script:AcceptDefaults -and (Read-YesNo "Change caption style or guidan
     Write-Host "  2. Comma tags     for booru-trained models such as Pony or Illustrious" -ForegroundColor DarkGray
     Write-Host ""
     $Tagify = ((Read-IntValue "Choice (1-2)" -Min 1 -Max 2 -Default 1) -eq 2)
+
+    if ($ConceptType -eq 'character') {
+        Write-Host ""
+        Write-Host "Does the subject's hair or facial hair change across these photos?" -ForegroundColor White
+        Write-Host "  Photos taken over months or years often vary: beard grown out, hair cut." -ForegroundColor DarkGray
+        Write-Host "  Yes -> those get described, so you can prompt for each look later." -ForegroundColor DarkGray
+        Write-Host "  No  -> they are left out and become part of the trigger word itself." -ForegroundColor DarkGray
+        Write-Host ""
+        $VariableAppearance = Read-YesNo "Hair or facial hair varies?" -Default $false
+    }
 
     Write-Host ""
     Write-Host "  Optional extra guidance passed to the captioner." -ForegroundColor DarkGray
@@ -872,8 +762,11 @@ Write-Host "  Resize:               $(if ($resizeImages) { "Long edge = ${resize
 Write-Host "  Training Rate:        $TrainingRate repeats/image" -ForegroundColor White
 Write-Host "  Steps Per Epoch:      $totalSteps" -ForegroundColor White
 Write-Host ""
-Write-Host "  Captioning:           $Provider$(if ($Model) { " ($Model)" } else { ' (auto-selected model)' })" -ForegroundColor White
+Write-Host "  Captioning:           Ollama$(if ($Model) { " / $Model" } else { ' / auto-selected model' })" -ForegroundColor White
 Write-Host "  Caption style:        $(if ($Tagify) { 'comma-separated tags' } else { 'prose clauses' })" -ForegroundColor White
+if ($ConceptType -eq 'character') {
+    Write-Host "  Hair/facial hair:     $(if ($VariableAppearance) { 'varies - will be described' } else { 'constant - absorbed by the trigger' })" -ForegroundColor White
+}
 if ($Instruction) {
     Write-Host "  Extra guidance:       $Instruction" -ForegroundColor White
 }
@@ -947,33 +840,37 @@ else {
     Write-Host "Copying and renaming images..." -ForegroundColor Cyan
 }
 
+$jobs = @()
 $counter = 1
-$resizedCount = 0
-$noResizeNeededCount = 0
-$resizeFailedCount = 0
 foreach ($imgFile in $imageAnalysis.Files) {
     $sourceExt = $imgFile.Extension.ToLower()
-    # Convert PNG/BMP/WebP → JPEG to avoid lossless bloat after resize
+    # Convert PNG/BMP/WebP to JPEG to avoid lossless bloat after resize.
     $destExt = if ($sourceExt -in @('.png', '.bmp', '.webp')) { '.jpg' } else { $sourceExt }
-    $newName = "$counter$destExt"
-    $destPath = Join-Path $trainDir $newName
-    
-    $copyResult = Copy-ImageWithOptionalResize -SourcePath $imgFile.FullName -DestinationPath $destPath -LongEdgeTarget $resizeLongEdge
-    if ($copyResult -eq "Resized") { $resizedCount++ }
-    elseif ($copyResult -eq "CopiedNoResizeNeeded") { $noResizeNeededCount++ }
-    elseif ($copyResult -eq "CopiedResizeFailed") { $resizeFailedCount++ }
-    
-    if ($counter % 10 -eq 0) {
-        Write-Host "  [ok] Processed $counter / $imageCount images..." -ForegroundColor DarkGray
+    $jobs += @{
+        source      = $imgFile.FullName
+        destination = (Join-Path $trainDir "$counter$destExt")
+        long_edge   = $resizeLongEdge
     }
-    
     $counter++
 }
+
+# One call for the whole batch; Python starts once rather than per image.
+$prepared = @(Invoke-ImagePreparation -Jobs $jobs -PythonExe $script:PythonExe)
+
+$resizedCount = @($prepared | Where-Object { $_.status -eq 'resized' }).Count
+$rotatedCount = @($prepared | Where-Object { $_.status -eq 'rotated' }).Count
+$noResizeNeededCount = @($prepared | Where-Object { $_.status -eq 'copied' }).Count
+$resizeFailedCount = @($prepared | Where-Object { $_.status -eq 'failed' }).Count
 
 Write-Host "  [ok] All $imageCount images copied and renamed" -ForegroundColor Green
 if ($resizeImages) {
     Write-Host "  [ok] Resized images: $resizedCount" -ForegroundColor Green
     Write-Host "  [ok] Already <= ${resizeLongEdge}px (copied as-is): $noResizeNeededCount" -ForegroundColor Green
+}
+if ($rotatedCount -gt 0) {
+    Write-Host "  [ok] Rotated to match EXIF orientation: $rotatedCount" -ForegroundColor Green
+}
+if ($resizeImages) {
     if ($resizeFailedCount -gt 0) {
         Write-Host "  ⚠ Resize unsupported/failed for $resizeFailedCount images; copied original files." -ForegroundColor Yellow
     }
@@ -982,7 +879,7 @@ if ($resizeImages) {
 # --- Step 10: Autocaption ---------------------------------------------------
 
 Write-Host ""
-Write-Host "Running autocaptioning (provider: $Provider)..." -ForegroundColor Cyan
+Write-Host "Running autocaptioning..." -ForegroundColor Cyan
 
 if (-not (Test-Path $CaptionScript)) {
     throw "caption.ps1 not found at $CaptionScript"
@@ -993,16 +890,16 @@ if (-not (Test-Path $CaptionScript)) {
 $captionArgs = @(
     '-ImageDir', $trainDir
     '-Concept', $ConceptName
-    '-Provider', $Provider
     '-Model', $Model
     '-InPlace'
     '-Overwrite'
 )
 if ($OllamaEndpoint) { $captionArgs += @('-OllamaEndpoint', $OllamaEndpoint) }
-if ($FlorenceEndpoint) { $captionArgs += @('-FlorenceEndpoint', $FlorenceEndpoint) }
 if ($ConceptType) { $captionArgs += @('-ConceptType', $ConceptType) }
 if ($Instruction) { $captionArgs += @('-Instruction', $Instruction) }
 if ($Tagify) { $captionArgs += '-Tagify' }
+if ($VariableAppearance) { $captionArgs += '-VariableAppearance' }
+if ($Provider -eq 'local') { $captionArgs += @('-LocalModel', $LocalModel) }
 
 & pwsh -NoProfile -File $CaptionScript @captionArgs
 
@@ -1013,10 +910,10 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "  [ok] Captions generated: captions.json / captions.csv" -ForegroundColor Green
 
-# --- Step 11: Launch Review UI (Docker) -------------------------------------
+# --- Step 11: Launch Review UI ----------------------------------------------
 
 Write-Host ""
-Write-Host "Launching caption review UI (Docker)..." -ForegroundColor Cyan
+Write-Host "Launching caption review UI..." -ForegroundColor Cyan
 
 if (-not (Test-Path $ReviewScript)) {
     throw "run-review-ui.ps1 not found at $ReviewScript"
@@ -1125,7 +1022,7 @@ Write-Host ""
 
 $openExplorer = Read-YesNo "Open dataset folder in Explorer?" -Default $true
 if ($openExplorer) {
-    explorer $trainDir
+    Open-InFileManager -Path $trainDir
 }
 
 Write-Host ""

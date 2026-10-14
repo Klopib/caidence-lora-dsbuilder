@@ -7,8 +7,8 @@
     tool stages a copy and writes captions beside the copy, so a user's source
     photos are never modified and a run can always be repeated from them.
 
-    The captioning provider is never reached: every case fails or returns
-    before a model call, or is driven through -WhatIf style argument checking.
+    No model is ever loaded: the cases either fail before captioning starts, or
+    point the ollama provider at a dead port so it fails immediately.
 #>
 
 BeforeAll {
@@ -59,7 +59,7 @@ Describe 'caption.ps1 source folder safety' {
         $out = Join-Path $TestDrive 'out2'
         try {
             & $script:CaptionScript -ImageDir $source -Concept 'test' `
-                -OutputDir $out -OllamaEndpoint 'http://127.0.0.1:9' -ErrorAction Stop
+                -OutputDir $out -Provider ollama -OllamaEndpoint 'http://127.0.0.1:9' -ErrorAction Stop
         }
         catch {
             # Expected: no provider is listening. Only the filesystem side
@@ -76,7 +76,7 @@ Describe 'caption.ps1 source folder safety' {
 
         try {
             & $script:CaptionScript -ImageDir $source -Concept 'test' `
-                -OutputDir $out -OllamaEndpoint 'http://127.0.0.1:9' -ErrorAction Stop
+                -OutputDir $out -Provider ollama -OllamaEndpoint 'http://127.0.0.1:9' -ErrorAction Stop
         }
         catch {
             # Expected: no provider is listening. Only the filesystem side
@@ -96,7 +96,7 @@ Describe 'caption.ps1 source folder safety' {
 
         try {
             & $script:CaptionScript -ImageDir $source -Concept 'test' `
-                -OutputDir $out -OllamaEndpoint 'http://127.0.0.1:9' -ErrorAction Stop
+                -OutputDir $out -Provider ollama -OllamaEndpoint 'http://127.0.0.1:9' -ErrorAction Stop
         }
         catch {
             # Expected: no provider is listening. Only the filesystem side
@@ -116,7 +116,7 @@ Describe 'caption.ps1 source folder safety' {
         $out = Join-Path $TestDrive 'out5'
         try {
             & $script:CaptionScript -ImageDir $source -Concept 'test' `
-                -OutputDir $out -OllamaEndpoint 'http://127.0.0.1:9' -ErrorAction Stop
+                -OutputDir $out -Provider ollama -OllamaEndpoint 'http://127.0.0.1:9' -ErrorAction Stop
         }
         catch {
             # Expected: no provider is listening. Only the filesystem side
