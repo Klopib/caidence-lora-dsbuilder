@@ -10,7 +10,10 @@
 param([switch]$Wait)
 
 $ErrorActionPreference = 'Stop'
-Push-Location (Join-Path $PSScriptRoot 'docker')
+# Repo root, one level up now that scripts live in scripts/.
+$RepoRoot = Split-Path $PSScriptRoot -Parent
+
+Push-Location (Join-Path $RepoRoot 'docker')
 try {
     docker compose up -d
     if ($LASTEXITCODE -ne 0) { throw "docker compose up failed (exit $LASTEXITCODE)." }

@@ -4,8 +4,12 @@ The end-to-end flow for building a LoRA dataset.
 
 ## 0) Pick a trigger word
 
-A short, distinctive token that is not an ordinary English word, e.g. `mikey`.
-It is used verbatim in every caption and is what you prompt with later.
+A short, distinctive token that is not an ordinary English word. It is used
+verbatim in every caption and is what you prompt with later.
+
+The commands below use `mikey` as the example concept name, with `.\photos\mikey`
+as the source folder and `.\datasets\mikey` as the generated dataset.
+Substitute your own throughout.
 
 ## 1) Make sure a captioning provider is up
 
@@ -23,13 +27,13 @@ ollama pull qwen3.5          # or llava, moondream, minicpm-v ...
 Fallback provider (Florence-2) - `caption.ps1` starts it automatically, or:
 
 ```powershell
-./start.ps1 -Wait            # blocks until the model has loaded
+./scripts/start.ps1 -Wait            # blocks until the model has loaded
 ```
 
 ## 2) Caption the folder
 
 ```powershell
-./caption.ps1 -ImageDir .\photos\mikey -Concept mikey
+./scripts/caption.ps1 -ImageDir .\photos\mikey -Concept mikey
 ```
 
 Useful switches:
@@ -65,7 +69,7 @@ template.
 ## 4) Review and edit
 
 ```powershell
-./run-review-ui.ps1 -DatasetDir .\datasets\mikey -Concept mikey
+./scripts/run-review-ui.ps1 -DatasetDir .\datasets\mikey -Concept mikey
 ```
 
 Step through with `<<  <  >  >>`. Every navigation saves. Fix anything the model
@@ -80,7 +84,7 @@ Click **End Task** when finished. The UI shuts down and captions are exported to
 Only required if you skipped the review UI:
 
 ```powershell
-./export-captions.ps1 -CaptionsJson .\datasets\mikey\captions.json -Overwrite
+./scripts/export-captions.ps1 -CaptionsJson .\datasets\mikey\captions.json -Overwrite
 ```
 
 ## 6) Train

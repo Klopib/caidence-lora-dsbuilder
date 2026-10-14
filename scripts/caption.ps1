@@ -44,14 +44,14 @@
 
 .EXAMPLE
     # Builds ./datasets/mikey from the source images, leaving the source alone.
-    ./caption.ps1 -ImageDir .\photos\mikey -Concept mikey
+    ./scripts/caption.ps1 -ImageDir .\photos\mikey -Concept mikey
 
 .EXAMPLE
-    ./caption.ps1 -ImageDir .\photos\mikey -Concept mikey -OutputDir D:\training\mikey
+    ./scripts/caption.ps1 -ImageDir .\photos\mikey -Concept mikey -OutputDir D:\training\mikey
 
 .EXAMPLE
     # Re-caption an existing dataset folder in place.
-    ./caption.ps1 -ImageDir .\datasets\mikey -Concept mikey -InPlace -Overwrite
+    ./scripts/caption.ps1 -ImageDir .\datasets\mikey -Concept mikey -InPlace -Overwrite
 #>
 
 [CmdletBinding()]
@@ -98,8 +98,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+# Repo root, one level up now that scripts live in scripts/.
+$RepoRoot = Split-Path $PSScriptRoot -Parent
 
-Import-Module (Join-Path $PSScriptRoot 'lib/Captioners.psm1') -Force
+
+Import-Module (Join-Path $RepoRoot 'lib/Captioners.psm1') -Force
 
 $ImageExtensions = @('.png', '.jpg', '.jpeg', '.webp', '.bmp')
 
@@ -200,7 +203,7 @@ function Initialize-OllamaProvider {
 
 
 function Initialize-FlorenceProvider {
-    $composeDir = Join-Path $PSScriptRoot 'docker'
+    $composeDir = Join-Path $RepoRoot 'docker'
 
     if (-not $SkipAutoStart) {
         $running = docker ps --filter 'name=florence-2' --format '{{.Names}}' 2>$null
@@ -268,7 +271,7 @@ if ($InPlace) {
 else {
     if (-not $OutputDir) {
         $root = if ($env:LORA_DATASET_ROOT) { $env:LORA_DATASET_ROOT }
-        else { Join-Path $PSScriptRoot 'datasets' }
+        else { Join-Path $RepoRoot 'datasets' }
         $OutputDir = Join-Path $root $Concept
     }
 

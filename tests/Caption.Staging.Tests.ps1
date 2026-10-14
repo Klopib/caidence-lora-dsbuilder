@@ -12,7 +12,7 @@
 #>
 
 BeforeAll {
-    $script:CaptionScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'caption.ps1'
+    $script:CaptionScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts/caption.ps1'
 
     function New-SourceFolder {
         param([int]$Count = 3)

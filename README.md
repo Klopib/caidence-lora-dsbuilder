@@ -49,6 +49,18 @@ step once cached, and is a useful fallback when Ollama is not running.
   - **Ollama** (default) with any vision-capable model installed
   - **Florence-2**, which needs nothing extra: `caption.ps1` starts the container
 
+## Conventions used in these examples
+
+The commands below use a running example so they can be copied and run as-is:
+
+| Placeholder | Example used here | Meaning |
+|---|---|---|
+| concept name | `mikey` | The trigger word you will prompt with later. Short, distinctive, not an ordinary English word. |
+| source folder | `.\photos\mikey` | Your original photos. Never modified. |
+| dataset folder | `.\datasets\mikey` | Generated output: staged images plus captions. |
+
+Substitute your own concept name throughout.
+
 ## Choosing a captioning backend
 
 Two providers ship with the tool. Neither is required in advance — pick whichever
@@ -60,7 +72,7 @@ Any model that reports Ollama's `vision` capability works. You do **not** need a
 specific one. If you already have a vision model, the tool finds and uses it:
 
 ```powershell
-./caption.ps1 -ImageDir .\photos\mikey -Concept mikey
+./scripts/caption.ps1 -ImageDir .\photos\mikey -Concept mikey
 #   No -Model given; looking for an installed vision model ...
 #   Using model minicpm-v:latest.
 ```
@@ -78,7 +90,7 @@ ollama list
 Pin a specific model when you want one:
 
 ```powershell
-./caption.ps1 -ImageDir .\photos\mikey -Concept mikey -Model llava:13b
+./scripts/caption.ps1 -ImageDir .\photos\mikey -Concept mikey -Model llava:13b
 ```
 
 Naming a text-only model is refused up front, with your vision-capable models
@@ -103,7 +115,7 @@ A self-contained container, useful when you would rather not run Ollama or need
 a fully offline fallback:
 
 ```powershell
-./caption.ps1 -ImageDir .\photos\mikey -Concept mikey -Provider florence
+./scripts/caption.ps1 -ImageDir .\photos\mikey -Concept mikey -Provider florence
 ```
 
 Florence-2 cannot take instructions, so its captions are normalised afterwards
@@ -117,13 +129,13 @@ Caption a folder of photos. This builds `./datasets/mikey` and leaves the source
 folder untouched:
 
 ```powershell
-./caption.ps1 -ImageDir .\photos\mikey -Concept mikey
+./scripts/caption.ps1 -ImageDir .\photos\mikey -Concept mikey
 ```
 
 Review and edit the captions in a browser, then export to `.txt`:
 
 ```powershell
-./run-review-ui.ps1 -DatasetDir .\datasets\mikey -Concept mikey
+./scripts/run-review-ui.ps1 -DatasetDir .\datasets\mikey -Concept mikey
 ```
 
 Or run the whole guided flow, which also builds the `<rate>_<concept>` folder
@@ -149,19 +161,19 @@ Written into the dataset folder, never into the source folder:
 
 ```powershell
 # Tag-style captions for booru-trained base models (Pony, Illustrious)
-./caption.ps1 -ImageDir .\data -Concept mikey -Tagify
+./scripts/caption.ps1 -ImageDir .\data -Concept mikey -Tagify
 
 # A non-character concept: describe the object instead of suppressing identity
-./caption.ps1 -ImageDir .\data -Concept caftan -ConceptType clothing
+./scripts/caption.ps1 -ImageDir .\data -Concept caftan -ConceptType clothing
 
 # Offline fallback
-./caption.ps1 -ImageDir .\data -Concept mikey -Provider florence
+./scripts/caption.ps1 -ImageDir .\data -Concept mikey -Provider florence
 
 # Pin a specific model instead of auto-selecting one
-./caption.ps1 -ImageDir .\data -Concept mikey -Model llava:13b
+./scripts/caption.ps1 -ImageDir .\data -Concept mikey -Model llava:13b
 
 # Extra guidance, appended to the prompt
-./caption.ps1 -ImageDir .\data -Concept mikey -Instruction "note the lighting direction"
+./scripts/caption.ps1 -ImageDir .\data -Concept mikey -Instruction "note the lighting direction"
 ```
 
 ### How captions are shaped
@@ -192,17 +204,24 @@ Anything flagged lands in `caption_issues.csv`. A clean run writes no such file.
 ## Repository layout
 
 ```
-lib/Captioners.psm1      Caption providers and post-processing (the core module)
-tests/                   Pester tests, including regressions for fixed bugs
-caption.ps1              Batch captioning CLI
-review_ui.py             Gradio review UI
-run-review-ui.ps1        Runs the review UI in Docker, then exports .txt files
-export-captions.ps1      captions.json -> per-image .txt
-New-LoraDataset.ps1             Guided end-to-end dataset preparation
-start/stop/rebuild/logs  Florence-2 container lifecycle
-docker/                  Florence-2 API image and compose file
-docs/                    Architecture and workflow notes
+New-LoraDataset.ps1          Start here: guided end-to-end dataset preparation
+
+scripts/
+  caption.ps1                Batch captioning CLI
+  run-review-ui.ps1          Runs the review UI in Docker, then exports .txt
+  export-captions.ps1        captions.json -> per-image .txt
+  start|stop|rebuild|logs    Florence-2 container lifecycle
+
+lib/Captioners.psm1          Caption providers and post-processing (core module)
+review_ui.py                 Gradio review UI
+tests/                       Pester tests, including fixed-bug regressions
+docker/                      Florence-2 API image and compose file
+docs/                        Architecture and workflow notes
+datasets/                    Default output root (git-ignored)
 ```
+
+The wizard is the only script at the root, so the entry point is obvious. It
+calls the scripts in `scripts/`, each of which also runs standalone.
 
 ## Development
 
@@ -256,8 +275,8 @@ vision-capable models; pass one with `-Model`, or omit `-Model` to auto-select.
 **Ollama is running but reports no models** - a host install and a container install
 keep separate model stores. Check which one owns port 11434.
 
-**Florence API not responding** - `./start.ps1 -Wait` blocks until the model has
-loaded; first run downloads ~1.5GB of weights. Then `./logs.ps1`.
+**Florence API not responding** - `./scripts/start.ps1 -Wait` blocks until the model has
+loaded; first run downloads ~1.5GB of weights. Then `./scripts/logs.ps1`.
 
 **Port already in use** - pass a different `-Port` to `run-review-ui.ps1`.
 

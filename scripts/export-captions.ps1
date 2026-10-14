@@ -9,7 +9,7 @@
     Overwrite existing .txt files. Default: $false.
 
 .EXAMPLE
-    .\export-captions.ps1 -CaptionsJson .\datasets\mikey\captions.json
+    .\scripts\export-captions.ps1 -CaptionsJson .\datasets\mikey\captions.json
 #>
 
 param(

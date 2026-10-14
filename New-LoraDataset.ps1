@@ -6,8 +6,8 @@
     Creates a standardized folder structure and prepares images for LoRA training
     using kohya_ss or similar training frameworks.
     
-    v1: Dataset preparation and folder structure only.
-    v2: Will add integrated captioning.
+    Runs the full flow: folder structure, image copy and optional resize,
+    autocaptioning, the review UI, and export to kohya_ss .txt files.
 
 .PARAMETER ConceptName
     Name of the concept you're training (e.g., "moroccan_caftan", "cyberpunk_edg").
@@ -46,6 +46,11 @@ param(
     # models (Pony, Illustrious); prose suits newer ones (Flux, SDXL).
     [switch]$Tagify,
 
+    # Accept the default answer to every confirmation prompt and run unattended.
+    # Requires the values that have no default to be passed as parameters:
+    # -ConceptName, -SourceImagesPath, -ConceptType and -TrainingRate.
+    [switch]$Yes,
+
     # Where prepared datasets are written. Resolution order:
     #   1. -BaseDir
     #   2. $env:LORA_DATASET_ROOT
@@ -59,11 +64,13 @@ param(
 
 # --- Config -----------------------------------------------------------------
 
-$FlorenceDir = $PSScriptRoot
-$CaptionScript = Join-Path $FlorenceDir "caption.ps1"
-$ReviewScript  = Join-Path $FlorenceDir "run-review-ui.ps1"
-$ExportScript  = Join-Path $FlorenceDir "export-captions.ps1"
+# Helper scripts live in scripts/; the wizard stays at the repo root.
+$ScriptsDir = Join-Path $PSScriptRoot 'scripts'
+$CaptionScript = Join-Path $ScriptsDir "caption.ps1"
+$ReviewScript  = Join-Path $ScriptsDir "run-review-ui.ps1"
+$ExportScript  = Join-Path $ScriptsDir "export-captions.ps1"
 $ErrorActionPreference = "Stop"
+$script:AcceptDefaults = [bool]$Yes
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -76,20 +83,39 @@ function Read-StringValue {
 }
 
 function Read-IntValue {
-    param([string]$Message, [int]$Default = 0)
+    param(
+        [string]$Message,
+        [int]$Default = 0,
+        [int]$Min = 1,
+        # 0 means no upper bound.
+        [int]$Max = 0
+    )
     while ($true) {
         $suffix = if ($Default) { " [$Default]" } else { "" }
         $val = Read-Host "$Message$suffix"
         if ([string]::IsNullOrWhiteSpace($val) -and $Default) { return $Default }
+
         $parsed = 0
-        if ([int]::TryParse($val, [ref]$parsed) -and $parsed -gt 0) { return $parsed }
-        Write-Host "  Please enter a valid number." -ForegroundColor Yellow
+        if ([int]::TryParse($val, [ref]$parsed) -and $parsed -ge $Min -and ($Max -le 0 -or $parsed -le $Max)) {
+            return $parsed
+        }
+
+        $range = if ($Max -gt 0) { "between $Min and $Max" } else { "$Min or greater" }
+        Write-Host "  Please enter a number $range." -ForegroundColor Yellow
     }
 }
 
 function Read-YesNo {
     param([string]$Message, [bool]$Default = $true)
     $hint = if ($Default) { "[Y]/n" } else { "y/[N]" }
+
+    # -Yes accepts every default so the wizard can run unattended. Read-Host
+    # reads the console rather than stdin, so answers cannot simply be piped in.
+    if ($script:AcceptDefaults) {
+        Write-Host "$Message ($hint) -> $(if ($Default) { 'y' } else { 'n' })" -ForegroundColor DarkGray
+        return $Default
+    }
+
     $val = Read-Host "$Message ($hint)"
     if ([string]::IsNullOrWhiteSpace($val)) { return $Default }
     return ($val.Trim().ToLower() -in @("y", "yes"))
@@ -295,12 +321,12 @@ function Get-ImageAnalysis {
 
 Write-Host ""
 Write-Host "╔═══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║                  LoRA Dataset Setup v2                    ║" -ForegroundColor Cyan
-Write-Host "║        (Structure, Copy, Florence Caption + Review)       ║" -ForegroundColor Cyan
+Write-Host "║                   LoRA Dataset Builder                    ║" -ForegroundColor Cyan
+Write-Host "║      (Structure, Copy, Autocaption, Review, Export)       ║" -ForegroundColor Cyan
 Write-Host "╚═══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "This script will prepare your images for LoRA training." -ForegroundColor White
-Write-Host "Includes: folder setup, image copy/resizing, Florence-2 autocaption, review UI." -ForegroundColor DarkGray
+Write-Host "Includes: folder setup, image copy/resizing, autocaptioning, review UI, export." -ForegroundColor DarkGray
 Write-Host ""
 
 # --- Step 1: Concept Name ---------------------------------------------------
@@ -410,7 +436,7 @@ if ($imageAnalysis.AvgWidth -ne "Unknown") {
 # Quality check
 if ($imageCount -lt 15) {
     Write-Host ""
-    Write-Host "  ⚠ WARNING: Less than 15 images detected" -ForegroundColor Yellow
+    Write-Host "  ⚠ WARNING: Fewer than 15 images detected" -ForegroundColor Yellow
     Write-Host "  Your LoRA quality will be significantly limited." -ForegroundColor Yellow
     Write-Host "  Recommended minimum: 20 images" -ForegroundColor Yellow
     Write-Host ""
@@ -490,10 +516,58 @@ $totalSteps = $imageCount * $TrainingRate
 Write-Host "  [ok] Training rate set to: $TrainingRate" -ForegroundColor Green
 Write-Host "  [ok] Total training steps per epoch: $totalSteps" -ForegroundColor Green
 
+# --- Step 6b: Captioning options --------------------------------------------
+
+# Defaults suit most runs, so this is one question deep unless the user opts in.
+Write-Host ""
+Write-Host "Captioning settings" -ForegroundColor White
+Write-Host "  Provider:     $Provider" -ForegroundColor DarkGray
+Write-Host "  Model:        $(if ($Model) { $Model } else { 'auto-select an installed vision model' })" -ForegroundColor DarkGray
+Write-Host "  Style:        $(if ($Tagify) { 'comma-separated tags' } else { 'prose clauses' })" -ForegroundColor DarkGray
+Write-Host "  Guidance:     $(if ($Instruction) { $Instruction } else { 'none' })" -ForegroundColor DarkGray
+Write-Host ""
+
+if (Read-YesNo "Change captioning settings?" -Default $false) {
+
+    Write-Host ""
+    Write-Host "Captioning backend:" -ForegroundColor White
+    Write-Host "  1. Ollama      (default) follows instructions, needs a vision model installed" -ForegroundColor DarkGray
+    Write-Host "  2. Florence-2  self-contained container, no model pull, lower caption quality" -ForegroundColor DarkGray
+    Write-Host ""
+    $Provider = if ((Read-IntValue "Choice (1-2)" -Min 1 -Max 2 -Default 1) -eq 2) { 'florence' } else { 'ollama' }
+
+    if ($Provider -eq 'ollama') {
+        Write-Host ""
+        Write-Host "  Leave blank to auto-select whichever installed model supports vision." -ForegroundColor DarkGray
+        $modelAnswer = (Read-Host "Ollama model [auto]").Trim()
+        if ($modelAnswer) { $Model = $modelAnswer }
+    }
+
+    Write-Host ""
+    Write-Host "Caption style:" -ForegroundColor White
+    Write-Host "  1. Prose clauses  (default) for Flux, SDXL and similar" -ForegroundColor DarkGray
+    Write-Host "  2. Comma tags     for booru-trained models such as Pony or Illustrious" -ForegroundColor DarkGray
+    Write-Host ""
+    $Tagify = ((Read-IntValue "Choice (1-2)" -Min 1 -Max 2 -Default 1) -eq 2)
+
+    Write-Host ""
+    Write-Host "  Optional extra guidance passed to the captioner." -ForegroundColor DarkGray
+    Write-Host "  Example: note the lighting direction" -ForegroundColor DarkGray
+    $instructionAnswer = (Read-Host "Extra guidance [none]").Trim()
+    if ($instructionAnswer) { $Instruction = $instructionAnswer }
+
+    Write-Host ""
+    Write-Host "  [ok] Captioning: $Provider / $(if ($Tagify) { 'tags' } else { 'prose' })" -ForegroundColor Green
+}
+
 # --- Step 7: Summary --------------------------------------------------------
 
 $projectDir = Join-Path $BaseDir $ConceptName
-$datasetsRootDir = Join-Path $projectDir "datasets"
+# 'img' rather than 'datasets': kohya_ss projects are laid out as
+# <project>/img, <project>/log, <project>/model, and the old name produced
+# paths like datasets\mikey\datasets\set_r5 once the default root became
+# ./datasets.
+$datasetsRootDir = Join-Path $projectDir "img"
 $datasetSetName = "set_r$TrainingRate"
 $datasetSetDir = Join-Path $datasetsRootDir $datasetSetName
 $trainDir = Join-Path $datasetSetDir "${TrainingRate}_${ConceptName}"
@@ -512,13 +586,19 @@ Write-Host "  Resize:               $(if ($resizeImages) { "Long edge = ${resize
 Write-Host "  Training Rate:        $TrainingRate repeats/image" -ForegroundColor White
 Write-Host "  Steps Per Epoch:      $totalSteps" -ForegroundColor White
 Write-Host ""
+Write-Host "  Captioning:           $Provider$(if ($Model) { " ($Model)" } else { ' (auto-selected model)' })" -ForegroundColor White
+Write-Host "  Caption style:        $(if ($Tagify) { 'comma-separated tags' } else { 'prose clauses' })" -ForegroundColor White
+if ($Instruction) {
+    Write-Host "  Extra guidance:       $Instruction" -ForegroundColor White
+}
+Write-Host ""
 Write-Host "  Output Structure:" -ForegroundColor White
 Write-Host "    $projectDir\" -ForegroundColor DarkGray
-Write-Host "    -- datasets\" -ForegroundColor DarkGray
+Write-Host "    -- img\" -ForegroundColor DarkGray
 Write-Host "    -  -- $datasetSetName\" -ForegroundColor DarkGray
 Write-Host "    -     -- ${TrainingRate}_${ConceptName}\" -ForegroundColor DarkGray
-Write-Host "    -        -- 1.png" -ForegroundColor DarkGray
-Write-Host "    -        -- 2.png" -ForegroundColor DarkGray
+Write-Host "    -        -- 1.jpg + 1.txt" -ForegroundColor DarkGray
+Write-Host "    -        -- 2.jpg + 2.txt" -ForegroundColor DarkGray
 Write-Host "    -        -- ... ($imageCount total)" -ForegroundColor DarkGray
 Write-Host "    -- log\" -ForegroundColor DarkGray
 Write-Host "    -- model\" -ForegroundColor DarkGray
@@ -526,7 +606,7 @@ Write-Host ""
 Write-Host "  Trainer path to use:" -ForegroundColor White
 Write-Host "    Training images folder = $datasetSetDir" -ForegroundColor DarkGray
 Write-Host ""
-Write-Host "  (Caption files will be added in v2)" -ForegroundColor DarkGray
+Write-Host "  Source images are copied, never modified: $SourceImagesPath" -ForegroundColor DarkGray
 Write-Host ""
 
 $confirm = Read-YesNo "Proceed with dataset preparation?" -Default $true
@@ -636,7 +716,7 @@ if ($ConceptType) { $captionArgs += @('-ConceptType', $ConceptType) }
 if ($Instruction) { $captionArgs += @('-Instruction', $Instruction) }
 if ($Tagify) { $captionArgs += '-Tagify' }
 
-& pwsh -File $CaptionScript @captionArgs
+& pwsh -NoProfile -File $CaptionScript @captionArgs
 
 if ($LASTEXITCODE -ne 0) { throw "Captioning failed (exit code $LASTEXITCODE)" }
 
@@ -651,7 +731,7 @@ if (-not (Test-Path $ReviewScript)) {
     throw "run-review-ui.ps1 not found at $ReviewScript"
 }
 
-& pwsh -File $ReviewScript `
+& pwsh -NoProfile -File $ReviewScript `
     -ImageDir $trainDir `
     -Concept $ConceptName `
     -Port 7861
@@ -678,7 +758,7 @@ if ($existingTxtCount -gt 0) {
         throw "captions.json not found at $captionsJsonPath"
     }
 
-    & pwsh -File $ExportScript `
+    & pwsh -NoProfile -File $ExportScript `
         -CaptionsJson $captionsJsonPath `
         -Overwrite
 
@@ -733,7 +813,7 @@ Write-Host "  $projectDir" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "What's been set up:" -ForegroundColor White
 Write-Host "  [ok] Folder structure created" -ForegroundColor Green
-Write-Host "  [ok] $imageCount images copied and renamed (1.png, 2.png, ...)" -ForegroundColor Green
+Write-Host "  [ok] $imageCount images copied and renamed (1, 2, 3, ...)" -ForegroundColor Green
 if ($resizeImages) {
     Write-Host "  [ok] Resize applied to $resizedCount images (long edge = ${resizeLongEdge}px)" -ForegroundColor Green
 }

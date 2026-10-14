@@ -17,7 +17,7 @@
     Optional shared port registry. Skipped when the file does not exist.
 
 .EXAMPLE
-    ./run-review-ui.ps1 -DatasetDir .\datasets\mikey -Concept mikey
+    ./scripts/run-review-ui.ps1 -DatasetDir .\datasets\mikey -Concept mikey
 #>
 
 param(
@@ -38,6 +38,9 @@ param(
 )
 
 $ExportScript = Join-Path $PSScriptRoot "export-captions.ps1"
+
+# Repo root, one level up now that scripts live in scripts/.
+$RepoRoot = Split-Path $PSScriptRoot -Parent
 
 $ErrorActionPreference = "Stop"
 
@@ -122,7 +125,9 @@ if ($hostPath -match '^[A-Za-z]:\\') {
 $volume = "${dockerHostPath}:${imageDirUnix}"
 
 Write-Host "Building review-ui image (florence-2-review-ui)..." -ForegroundColor Cyan
-docker build -f docker/Dockerfile.review -t florence-2-review-ui .
+# Paths are resolved from the repo root rather than the caller's working
+# directory, so the script works no matter where it is invoked from.
+docker build -f (Join-Path $RepoRoot 'docker/Dockerfile.review') -t florence-2-review-ui $RepoRoot
 if ($LASTEXITCODE -ne 0) { throw "docker build failed." }
 
 Write-Host "Starting review UI at http://127.0.0.1:$Port ..." -ForegroundColor Green

@@ -6,7 +6,10 @@
 param()
 
 $ErrorActionPreference = 'Stop'
-Push-Location (Join-Path $PSScriptRoot 'docker')
+# Repo root, one level up now that scripts live in scripts/.
+$RepoRoot = Split-Path $PSScriptRoot -Parent
+
+Push-Location (Join-Path $RepoRoot 'docker')
 try {
     docker compose down
     if ($LASTEXITCODE -ne 0) { throw "docker compose down failed (exit $LASTEXITCODE)." }
