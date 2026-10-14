@@ -62,8 +62,17 @@ file cannot discard the captions already produced in a long run.
 
 `review_ui.py` is a small Gradio app that steps through the dataset, showing each
 image with its caption in an editable box. Every navigation action saves, so there
-is no unsaved state to lose. `run-review-ui.ps1` builds the image, mounts the
-dataset at `/data` and runs the export step when the UI exits.
+is no unsaved state to lose.
+
+`run-review-ui.ps1` runs it on the host by default, in a virtual environment it
+creates once under `.venv_review`, and runs the export step when the UI exits.
+Nothing here needs a container: the app reads and writes local files and serves
+a local port.
+
+`-Docker` runs the same script in a container instead, for machines with no
+Python. That path mounts the dataset at `/data`, so the UI resolves images by
+filename against the mount point rather than by the Windows paths stored in
+`captions.json`.
 
 The container sees Linux paths while `captions.json` stores Windows paths, so
 images are resolved by filename against the mount point. This keeps the JSON

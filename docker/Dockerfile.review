@@ -1,19 +1,19 @@
-FROM python:3.10-slim
+# Container form of the caption review UI.
+#
+# Optional. The UI is a small Gradio app and runs on the host by default;
+# this image exists only for machines with no Python available.
+#
+# Previously this pinned gradio 4.31.4 and force-reinstalled fastapi and
+# starlette to work around that version's dependency conflicts. Current Gradio
+# installs cleanly with no pins, so the workaround is gone.
+FROM python:3.13-slim
 
 WORKDIR /workspace
 
-# Copy the review UI script into the image
-COPY review_ui.py /workspace/review_ui.py
-
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir \
-        gradio==4.31.4 \
-        gradio_client==0.16.4 \
-        pillow==9.5.0 \
-        huggingface_hub==0.23.4 \
-    && pip install --no-cache-dir --force-reinstall \
-        fastapi==0.110.2 \
-        starlette==0.37.2
+    && pip install --no-cache-dir gradio
+
+COPY review_ui.py /workspace/review_ui.py
 
 EXPOSE 7861
 

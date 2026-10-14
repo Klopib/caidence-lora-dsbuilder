@@ -106,12 +106,25 @@ asymmetric between them, is covered in
 
 ## Requirements
 
+**Always:**
+
 - Windows 10/11, PowerShell 7+ (`pwsh`)
-- Docker Desktop (Linux containers)
-- NVIDIA GPU recommended
-- A captioning backend — either of:
-  - **Ollama** (default) with any vision-capable model installed
-  - **Florence-2**, which needs nothing extra: `caption.ps1` starts the container
+- Somewhere to caption: an Ollama with a vision-capable model. It can be a
+  native install, a container, or an instance on another machine — the tool
+  just makes HTTP calls to it and does not care how it is hosted.
+- Python 3.10–3.13 for the review UI. A virtual environment is created on first
+  use, so nothing on your system Python changes.
+
+**Optional:**
+
+- An NVIDIA GPU. Captioning works on CPU, just slower.
+- **Docker**, only if you want one of:
+  - `scripts/setup-captioner.ps1`, which installs and runs a captioner for you
+  - the `florence` provider, which runs in a container
+  - `run-review-ui.ps1 -Docker`, for machines with no Python
+
+Docker is not needed for the default path. Captioning is an HTTP call and the
+rest of the pipeline is PowerShell.
 
 ## Conventions used in these examples
 
@@ -324,14 +337,14 @@ New-LoraDataset.ps1          Start here: guided end-to-end dataset preparation
 
 scripts/
   caption.ps1                Batch captioning CLI
-  run-review-ui.ps1          Runs the review UI in Docker, then exports .txt
+  run-review-ui.ps1          Runs the review UI, then exports .txt files
   export-captions.ps1        captions.json -> per-image .txt
   start|stop|rebuild|logs    Florence-2 container lifecycle
 
 lib/Captioners.psm1          Caption providers and post-processing (core module)
 review_ui.py                 Gradio review UI
 tests/                       Pester tests, including fixed-bug regressions
-docker/                      Florence-2 API image and compose file
+docker/                      Optional: Florence-2 image, compose, review image
 docs/                        Architecture, workflow and decision guide
   ARCHITECTURE.md            Components, data flow and design decisions
   WORKFLOW.md                Step-by-step from photos to trained dataset

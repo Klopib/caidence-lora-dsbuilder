@@ -72,6 +72,11 @@ template.
 ./scripts/run-review-ui.ps1 -DatasetDir .\datasets\mikey -Concept mikey
 ```
 
+This runs on the host. A virtual environment holding Gradio is created under
+`.venv_review` on first use and reused after; your system Python is untouched.
+Add `-Docker` to run it in a container instead, which is only useful on a
+machine with no Python.
+
 Step through with `<<  <  >  >>`. Every navigation saves. Fix anything the model
 got wrong - especially hallucinated detail, which is the failure mode that most
 degrades a dataset.

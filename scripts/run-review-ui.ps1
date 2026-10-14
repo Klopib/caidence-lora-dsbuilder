@@ -29,6 +29,10 @@ param(
   [Parameter(Mandatory = $true)][string]$Concept,
   [int]$Port = 7861,
 
+  # Run the UI in a container instead of on the host. Only needed when there
+  # is no Python available; the UI itself has no use for Docker.
+  [switch]$Docker,
+
   # Optional shared port registry, for machines that coordinate ports across
   # several local services. Empty means no registry, which is the default;
   # set $env:LORA_PORT_REGISTRY to opt in.
@@ -113,37 +117,123 @@ $capsJson = Join-Path $ImageDir "captions.json"
 $capsCsv  = Join-Path $ImageDir "captions.csv"
 if (-not (Test-Path $capsJson) -or -not (Test-Path $capsCsv)) { throw "captions.json / captions.csv not found in $ImageDir. Run caption.ps1 first." }
 
-$imageDirUnix = "/data"
-$hostPath = (Resolve-Path $ImageDir).ProviderPath
-if ($hostPath -match '^[A-Za-z]:\\') {
-  $drive = $hostPath.Substring(0,1).ToLower()
-  $rest = $hostPath.Substring(2) -replace '\\','/'
-  $dockerHostPath = "/${drive}${rest}"
-} else {
-  $dockerHostPath = $hostPath -replace '\\','/'
+function Find-HostPython {
+  <#
+    .SYNOPSIS
+      Finds a Python suitable for running the review UI.
+    .DESCRIPTION
+      Newest-tested first. A very new Python is skipped because wheels for it
+      often lag; any of these can install current Gradio.
+  #>
+  foreach ($v in '3.13', '3.12', '3.11', '3.10') {
+    $exe = & py "-$v" -c "import sys; print(sys.executable)" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $exe) { return $exe.Trim() }
+  }
+  $exe = & python -c "import sys; print(sys.executable)" 2>$null
+  if ($LASTEXITCODE -eq 0 -and $exe) { return $exe.Trim() }
+  return $null
 }
-$volume = "${dockerHostPath}:${imageDirUnix}"
 
-Write-Host "Building review-ui image (florence-2-review-ui)..." -ForegroundColor Cyan
-# Paths are resolved from the repo root rather than the caller's working
-# directory, so the script works no matter where it is invoked from.
-docker build -f (Join-Path $RepoRoot 'docker/Dockerfile.review') -t florence-2-review-ui $RepoRoot
-if ($LASTEXITCODE -ne 0) { throw "docker build failed." }
+function Initialize-ReviewVenv {
+  <#
+    .SYNOPSIS
+      Creates (once) a virtual environment holding Gradio and returns its python.
+    .DESCRIPTION
+      Kept out of the system Python so nothing on the machine is altered. Built
+      on first use and reused afterwards.
+  #>
+  param([string]$BasePython, [string]$VenvPath)
 
-Write-Host "Starting review UI at http://127.0.0.1:$Port ..." -ForegroundColor Green
-Write-Host "docker run --rm -p ${Port}:7861 -v ${volume} florence-2-review-ui ..." -ForegroundColor DarkGray
+  $venvPython = Join-Path $VenvPath 'Scripts/python.exe'
 
-docker run --rm `
-  -p "${Port}:7861" `
-  -v "${volume}" `
-  florence-2-review-ui `
-  python /workspace/review_ui.py `
-    --captions "$imageDirUnix/captions.json" `
-    --csv "$imageDirUnix/captions.csv" `
-    --concept "$Concept" `
-    --port 7861
+  if (-not (Test-Path $venvPython)) {
+    Write-Host "  Creating a Python environment for the review UI ..." -ForegroundColor Cyan
+    Write-Host "    $VenvPath" -ForegroundColor DarkGray
+    & $BasePython -m venv $VenvPath
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPython)) {
+      throw "Could not create a virtual environment with $BasePython"
+    }
+  }
 
-if ($LASTEXITCODE -ne 0) { throw "review UI container exited with code $LASTEXITCODE" }
+  & $venvPython -c "import gradio" 2>$null
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "  Installing Gradio (one time, about a minute) ..." -ForegroundColor Cyan
+    & $venvPython -m pip install --quiet --upgrade pip
+    & $venvPython -m pip install --quiet gradio
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to install Gradio.' }
+  }
+
+  return $venvPython
+}
+
+
+$capsJson = Join-Path $ImageDir "captions.json"
+$capsCsv  = Join-Path $ImageDir "captions.csv"
+if (-not (Test-Path $capsJson) -or -not (Test-Path $capsCsv)) {
+  throw "captions.json / captions.csv not found in $ImageDir. Run caption.ps1 first."
+}
+
+if ($Docker) {
+
+  # Container path: no Python needed on the host.
+  $hostPath = (Resolve-Path $ImageDir).ProviderPath
+  if ($hostPath -match '^[A-Za-z]:\') {
+    $drive = $hostPath.Substring(0,1).ToLower()
+    $rest = $hostPath.Substring(2) -replace '\','/'
+    $dockerHostPath = "/${drive}${rest}"
+  } else {
+    $dockerHostPath = $hostPath -replace '\','/'
+  }
+  $volume = "${dockerHostPath}:/data"
+
+  Write-Host "Building review-ui image ..." -ForegroundColor Cyan
+  # Paths resolve from the repo root, not the caller's working directory.
+  docker build -f (Join-Path $RepoRoot 'docker/Dockerfile.review') -t lora-review-ui $RepoRoot
+  if ($LASTEXITCODE -ne 0) { throw "docker build failed." }
+
+  Write-Host ""
+  Write-Host "  Review UI: http://127.0.0.1:$Port" -ForegroundColor Green
+  Write-Host ""
+
+  docker run --rm `
+    -p "${Port}:7861" `
+    -v "${volume}" `
+    lora-review-ui `
+    python /workspace/review_ui.py `
+      --captions "/data/captions.json" `
+      --csv "/data/captions.csv" `
+      --concept "$Concept" `
+      --host "0.0.0.0" `
+      --port 7861
+
+  if ($LASTEXITCODE -ne 0) { throw "review UI container exited with code $LASTEXITCODE" }
+
+} else {
+
+  # Default: run on the host. The review UI is a small Gradio app and needs
+  # no container, which keeps Docker out of the common path entirely.
+  $basePython = Find-HostPython
+  if (-not $basePython) {
+    throw ("No suitable Python found for the review UI.`n" +
+      "  Install Python 3.10-3.13 from https://python.org, or`n" +
+      "  re-run with -Docker to use the container instead.")
+  }
+
+  $venvPython = Initialize-ReviewVenv -BasePython $basePython -VenvPath (Join-Path $RepoRoot '.venv_review')
+
+  Write-Host ""
+  Write-Host "  Review UI: http://127.0.0.1:$Port" -ForegroundColor Green
+  Write-Host ""
+
+  & $venvPython (Join-Path $RepoRoot 'review_ui.py') `
+    --captions $capsJson `
+    --csv $capsCsv `
+    --concept $Concept `
+    --host '127.0.0.1' `
+    --port $Port
+
+  if ($LASTEXITCODE -ne 0) { throw "review UI exited with code $LASTEXITCODE" }
+}
 
 
 Write-Host "Exporting captions to .txt files..." -ForegroundColor Cyan

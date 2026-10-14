@@ -5,29 +5,9 @@ import os
 import time
 import threading
 
+import inspect
+
 import gradio as gr
-
-# Patch gradio_client bool schema handling (avoids API info crash in some versions).
-try:
-    from gradio_client import utils as gc_utils
-
-    _orig_get_type = gc_utils.get_type
-    _orig_json_schema_to_python_type = gc_utils._json_schema_to_python_type
-
-    def _get_type_patched(schema):
-        if isinstance(schema, bool):
-            return "any"
-        return _orig_get_type(schema)
-
-    def _json_schema_to_python_type_patched(schema, defs):
-        if isinstance(schema, bool):
-            return "any"
-        return _orig_json_schema_to_python_type(schema, defs)
-
-    gc_utils.get_type = _get_type_patched
-    gc_utils._json_schema_to_python_type = _json_schema_to_python_type_patched
-except Exception:
-    pass
 
 DATA = []
 JSON_PATH = ""
@@ -217,6 +197,8 @@ def main():
     parser.add_argument("--csv", required=True, help="Path to captions.csv")
     parser.add_argument("--concept", required=False, default="", help="Concept name (display only)")
     parser.add_argument("--port", type=int, default=7860, help="Port for Gradio UI")
+    # 0.0.0.0 is needed inside a container; 127.0.0.1 keeps a host run local.
+    parser.add_argument("--host", default="127.0.0.1", help="Address to bind")
     args = parser.parse_args()
 
     global DATA, JSON_PATH, CSV_PATH, DATA_DIR
@@ -247,7 +229,14 @@ def main():
     }
     """ % {"h": IMAGE_HEIGHT}
 
-    with gr.Blocks(title=title, css=css) as demo:
+    # Gradio 6 moved css from the Blocks constructor to launch(). Detect which
+    # one this version accepts so the UI runs unchanged on either.
+    css_on_launch = "css" in inspect.signature(gr.Blocks.launch).parameters
+    blocks_kwargs = {"title": title}
+    if not css_on_launch:
+        blocks_kwargs["css"] = css
+
+    with gr.Blocks(**blocks_kwargs) as demo:
         gr.Markdown(f"### {title}")
         image = gr.Image(
             type="filepath",
@@ -299,13 +288,17 @@ def main():
             inputs=[caption, state_holder],
             outputs=[image, caption, progress, status, state_holder, first_btn, prev_btn, next_btn, last_btn, end_btn],
         )
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=args.port,
-        share=False,
-        inbrowser=False,
-        allowed_paths=[DATA_DIR],
-    )
+    launch_kwargs = {
+        "server_name": args.host,
+        "server_port": args.port,
+        "share": False,
+        "inbrowser": False,
+        "allowed_paths": [DATA_DIR],
+    }
+    if css_on_launch:
+        launch_kwargs["css"] = css
+
+    demo.launch(**launch_kwargs)
 
 
 if __name__ == "__main__":

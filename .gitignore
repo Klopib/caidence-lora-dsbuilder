@@ -14,6 +14,7 @@ docker/.env
 __pycache__/
 *.pyc
 .venv*/
+.venv_review/
 
 # Logs
 *.log
