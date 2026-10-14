@@ -103,6 +103,9 @@ Point kohya_ss at the dataset folder. Each image now has a matching `.txt`.
 It prompts for concept name, type, source images and training rate, offers to
 resize oversized images, then runs caption -> review -> export.
 
+See the [decision guide](DECISIONS.md) for every question it asks and what each
+answer changes.
+
 ## Notes
 
 - The source folder is read-only. Images are copied into the dataset folder and

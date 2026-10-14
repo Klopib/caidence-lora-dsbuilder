@@ -43,7 +43,24 @@ Any ordinary folder of images, straight off a phone or camera. Mixed filenames,
 mixed sizes and mixed orientations are all fine. **This folder is only ever read
 from** - nothing is written back into it.
 
-### 3. Get a training-ready dataset
+### 3. Review the captions
+
+![The review UI showing one image with its caption and navigation controls](docs/images/review-ui.png)
+
+Captions are generated, not guaranteed. A vision model will occasionally invent
+a detail that is not in the photo, and a confidently wrong caption teaches the
+model something false about your concept - the failure mode that degrades a
+dataset fastest.
+
+So the wizard opens a browser UI and steps you through every image with its
+caption in an editable box. Every navigation action saves, so there is no
+unsaved state to lose. Click **End Task** when you are done and the pipeline
+continues on its own.
+
+This step is where a dataset goes from automatic to actually good, and it is
+worth the few minutes.
+
+### 4. Get a training-ready dataset
 
 ![The output folder, with sequential images each paired with a .txt caption](docs/images/output-folder.webp)
 
@@ -224,6 +241,9 @@ The wizard asks for the concept, source images and training rate, then offers
 the captioning settings. Models are chosen from a list of your installed
 vision-capable models, so a text-only model cannot be picked by mistake.
 
+Every question it asks, and how to answer it, is covered in the
+[decision guide](docs/DECISIONS.md).
+
 Add `-Yes` to accept every default and run unattended, supplying the values
 that have no default:
 
@@ -303,7 +323,7 @@ lib/Captioners.psm1          Caption providers and post-processing (core module)
 review_ui.py                 Gradio review UI
 tests/                       Pester tests, including fixed-bug regressions
 docker/                      Florence-2 API image and compose file
-docs/                        Architecture and workflow notes
+docs/                        Architecture, workflow and decision guide
 datasets/                    Default output root (git-ignored)
 ```
 

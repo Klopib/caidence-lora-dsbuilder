@@ -108,3 +108,8 @@ model output rather than invented strings.
 port. The caches are large and shared between projects, so they live outside the
 repo; the compose file otherwise uses paths relative to itself so the repo can be
 cloned anywhere.
+
+## See also
+
+- [WORKFLOW.md](WORKFLOW.md) - the end-to-end flow
+- [DECISIONS.md](DECISIONS.md) - every wizard question and what it changes
