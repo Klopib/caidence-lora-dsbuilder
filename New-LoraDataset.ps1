@@ -336,23 +336,56 @@ function Copy-ImageWithOptionalResize {
 
     try {
         $sourceImage = [System.Drawing.Image]::FromFile($SourcePath)
+
+        # Phone cameras store a photo in sensor orientation and record how to
+        # rotate it in EXIF tag 274. System.Drawing neither applies that tag nor
+        # carries it into a saved bitmap, so a resized portrait would be written
+        # sideways and train the model on rotated images.
+        $orientation = 1
+        if ($sourceImage.PropertyIdList -contains 274) {
+            $orientation = [BitConverter]::ToUInt16($sourceImage.GetPropertyItem(274).Value, 0)
+        }
+
+        if ($orientation -ne 1) {
+            $rotate = switch ($orientation) {
+                2 { [System.Drawing.RotateFlipType]::RotateNoneFlipX }
+                3 { [System.Drawing.RotateFlipType]::Rotate180FlipNone }
+                4 { [System.Drawing.RotateFlipType]::Rotate180FlipX }
+                5 { [System.Drawing.RotateFlipType]::Rotate90FlipX }
+                6 { [System.Drawing.RotateFlipType]::Rotate90FlipNone }
+                7 { [System.Drawing.RotateFlipType]::Rotate270FlipX }
+                8 { [System.Drawing.RotateFlipType]::Rotate270FlipNone }
+                default { $null }
+            }
+            if ($rotate) {
+                $sourceImage.RotateFlip($rotate)
+                # The pixels now match what the tag described; leaving the tag in
+                # place would make a viewer rotate the image a second time.
+                $sourceImage.RemovePropertyItem(274)
+            }
+        }
+
         $currentLongEdge = [Math]::Max($sourceImage.Width, $sourceImage.Height)
 
-        # No resize needed — but still may need format conversion (e.g. PNG → JPEG)
+        # No resize needed - but the file may still need re-encoding, either to
+        # change format or to bake in the rotation handled above. Trainers read
+        # images with PIL, which ignores EXIF orientation, so a rotated photo
+        # copied verbatim would be trained on sideways.
         if ($LongEdgeTarget -le 0 -or $currentLongEdge -le $LongEdgeTarget) {
             $sourceExt = [System.IO.Path]::GetExtension($SourcePath).ToLowerInvariant()
-            if ($isJpegDest -and $sourceExt -notin @('.jpg', '.jpeg')) {
-                # Format conversion without resize
+            $needsReencode = ($orientation -ne 1) -or ($isJpegDest -and $sourceExt -notin @('.jpg', '.jpeg'))
+
+            if ($needsReencode) {
                 $bitmap = New-Object System.Drawing.Bitmap($sourceImage)
                 try { Save-Bitmap $bitmap $DestinationPath }
                 finally { $bitmap.Dispose() }
-                return "CopiedNoResizeNeeded"
-            } else {
-                $sourceImage.Dispose()
-                $sourceImage = $null
-                Copy-Item -Path $SourcePath -Destination $DestinationPath -Force
-                return "CopiedNoResizeNeeded"
+                return $(if ($orientation -ne 1) { "Rotated" } else { "CopiedNoResizeNeeded" })
             }
+
+            $sourceImage.Dispose()
+            $sourceImage = $null
+            Copy-Item -Path $SourcePath -Destination $DestinationPath -Force
+            return "CopiedNoResizeNeeded"
         }
 
         $scale = [double]$LongEdgeTarget / [double]$currentLongEdge

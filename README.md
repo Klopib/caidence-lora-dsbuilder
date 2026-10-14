@@ -145,14 +145,17 @@ suits what you already have.
 
 ### No captioner yet? Set one up
 
-If you have no Ollama install, this project can run its own. Docker is the only
-prerequisite, and it is already required for the review UI:
+If you have no captioner yet, you have two options. Install
+[Ollama](https://ollama.com) and `ollama pull qwen3.5` — or, if you would rather
+not install it, let this project run one in Docker:
 
 ```powershell
 ./scripts/setup-captioner.ps1
 ```
 
-It starts a captioner owned by this project and downloads a vision model:
+The script checks what is already there before changing anything. If an Ollama
+is already serving the port with a vision model, it uses that and installs
+nothing. Otherwise it starts a captioner of its own and downloads a model:
 
 | Model | Download | Notes |
 |---|---|---|
@@ -162,13 +165,15 @@ It starts a captioner owned by this project and downloads a vision model:
 | `qwen2.5vl:3b` | ~3.2 GB | Alternative family, shorter context |
 | `moondream` | ~1.7 GB | Smallest option, basic captions |
 
-Models are stored in a Docker volume, not in the repo, and downloaded once.
+Models are downloaded once and never stored in the repo. Where they land depends
+on which captioner ends up being used: an Ollama you already run keeps them
+wherever it normally does, while a captioner started by this script keeps them
+in a Docker volume of its own.
 
-**It will not disturb an Ollama you already run.** If one is already serving the
-port with a vision model, the script uses it and installs nothing. If the port
-is held by something that is not Ollama, it moves to the next free port and
-says so. The managed container is named `lora-captioner` and keeps its own
-volume, so an existing `ollama` container and its models are never touched.
+**It will not disturb an Ollama you already run.** If the port is held by
+something that is not Ollama, the script moves to the next free port and says
+so. The managed container is named `lora-captioner`, not `ollama`, and keeps
+its own volume, so an existing container and its models are never written to.
 
 The wizard offers this too: if no captioning backend is reachable, setting one
 up is one of the options rather than a dead end.
