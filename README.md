@@ -145,6 +145,18 @@ structure kohya_ss expects:
 ./New-LoraDataset.ps1
 ```
 
+The wizard asks for the concept, source images and training rate, then offers
+the captioning settings. Models are chosen from a list of your installed
+vision-capable models, so a text-only model cannot be picked by mistake.
+
+Add `-Yes` to accept every default and run unattended, supplying the values
+that have no default:
+
+```powershell
+./New-LoraDataset.ps1 -Yes -ConceptName mikey -ConceptType character `
+    -SourceImagesPath .\photos\mikey -TrainingRate 10
+```
+
 ### Outputs
 
 Written into the dataset folder, never into the source folder:

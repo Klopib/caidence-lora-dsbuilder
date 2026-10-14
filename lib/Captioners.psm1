@@ -411,6 +411,37 @@ function Get-OllamaModelCapability {
 }
 
 
+function Get-OllamaVisionModelList {
+    <#
+    .SYNOPSIS
+        Lists every installed Ollama model that can accept images.
+
+    .DESCRIPTION
+        Probes each installed model's capabilities. Used to offer a pick-list
+        rather than asking someone to type a model name: a name typed by hand
+        is easy to get wrong, and a text-only model typed correctly still
+        fails later.
+
+    .OUTPUTS
+        Array of model names, possibly empty.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Endpoint = 'http://localhost:11434',
+        [int]$TimeoutSec = 30
+    )
+
+    $tags = Invoke-RestMethod -Method Get -Uri "$Endpoint/api/tags" -TimeoutSec $TimeoutSec
+    $installed = @($tags.models | ForEach-Object { $_.name })
+
+    return @(
+        $installed | Where-Object {
+            (Get-OllamaModelCapability -Model $_ -Endpoint $Endpoint -TimeoutSec $TimeoutSec) -contains 'vision'
+        }
+    )
+}
+
+
 function Get-OllamaVisionModel {
     <#
     .SYNOPSIS
@@ -598,6 +629,7 @@ function Get-ImageCaption {
 Export-ModuleMember -Function @(
     'Get-OllamaModelCapability'
     'Get-OllamaVisionModel'
+    'Get-OllamaVisionModelList'
     'Remove-CaptionPreamble'
     'Convert-ToTags'
     'Set-CaptionSubject'

@@ -40,7 +40,13 @@ param(
     [ValidateSet("ollama", "florence")]
     [string]$Provider = "ollama",
 
-    [string]$Model = "qwen3.5",
+    # Blank means auto-select an installed vision-capable model.
+    [string]$Model = "",
+
+    [string]$OllamaEndpoint = "http://localhost:11434",
+
+    # Port for the caption review UI.
+    [int]$ReviewPort = 7861,
 
     # Comma-separated tags instead of prose. Tag captions suit booru-style base
     # models (Pony, Illustrious); prose suits newer ones (Flux, SDXL).
@@ -71,6 +77,25 @@ $ReviewScript  = Join-Path $ScriptsDir "run-review-ui.ps1"
 $ExportScript  = Join-Path $ScriptsDir "export-captions.ps1"
 $ErrorActionPreference = "Stop"
 $script:AcceptDefaults = [bool]$Yes
+
+Import-Module (Join-Path $PSScriptRoot 'lib/Captioners.psm1') -Force
+
+# Any terminating error used to end the script instantly. Launched from an
+# icon or a transient terminal, that closed the window before the reason could
+# be read. Hold the window open unless running unattended.
+trap {
+    Write-Host ""
+    Write-Host "----------------------------------------------------------------" -ForegroundColor Red
+    Write-Host " Dataset preparation stopped" -ForegroundColor Red
+    Write-Host "----------------------------------------------------------------" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Any output above this line explains what went wrong." -ForegroundColor DarkGray
+    Write-Host ""
+    if (-not $script:AcceptDefaults) { pause }
+    exit 1
+}
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -538,9 +563,37 @@ if (Read-YesNo "Change captioning settings?" -Default $false) {
 
     if ($Provider -eq 'ollama') {
         Write-Host ""
-        Write-Host "  Leave blank to auto-select whichever installed model supports vision." -ForegroundColor DarkGray
-        $modelAnswer = (Read-Host "Ollama model [auto]").Trim()
-        if ($modelAnswer) { $Model = $modelAnswer }
+        Write-Host "Looking up vision-capable models in Ollama..." -ForegroundColor DarkGray
+
+        $visionModels = @()
+        try {
+            $visionModels = @(Get-OllamaVisionModelList -Endpoint $OllamaEndpoint)
+        }
+        catch {
+            Write-Host "  Could not reach Ollama at $OllamaEndpoint." -ForegroundColor Yellow
+            Write-Host "  Continuing with auto-selection at caption time." -ForegroundColor Yellow
+        }
+
+        if ($visionModels.Count -eq 0) {
+            Write-Host "  No vision-capable model found; the captioner will auto-select or report why." -ForegroundColor Yellow
+        }
+        else {
+            # Only models that can actually accept images are offered. Typing a
+            # name by hand invited both typos and text-only models, which fail
+            # only once captioning starts.
+            Write-Host ""
+            Write-Host "Ollama model:" -ForegroundColor White
+            Write-Host "  1. Auto-select (recommended)" -ForegroundColor DarkGray
+            for ($i = 0; $i -lt $visionModels.Count; $i++) {
+                Write-Host "  $($i + 2). $($visionModels[$i])" -ForegroundColor DarkGray
+            }
+            Write-Host ""
+            Write-Host "  Only models that can accept images are listed." -ForegroundColor DarkGray
+            Write-Host ""
+
+            $pick = Read-IntValue "Choice (1-$($visionModels.Count + 1))" -Min 1 -Max ($visionModels.Count + 1) -Default 1
+            $Model = if ($pick -eq 1) { '' } else { $visionModels[$pick - 2] }
+        }
     }
 
     Write-Host ""
@@ -712,13 +765,17 @@ $captionArgs = @(
     '-InPlace'
     '-Overwrite'
 )
+if ($OllamaEndpoint) { $captionArgs += @('-OllamaEndpoint', $OllamaEndpoint) }
 if ($ConceptType) { $captionArgs += @('-ConceptType', $ConceptType) }
 if ($Instruction) { $captionArgs += @('-Instruction', $Instruction) }
 if ($Tagify) { $captionArgs += '-Tagify' }
 
 & pwsh -NoProfile -File $CaptionScript @captionArgs
 
-if ($LASTEXITCODE -ne 0) { throw "Captioning failed (exit code $LASTEXITCODE)" }
+if ($LASTEXITCODE -ne 0) {
+    throw ("Captioning failed (exit code $LASTEXITCODE). The images were copied " +
+        "to $trainDir, so you can re-run captioning there without redoing this setup.")
+}
 
 Write-Host "  [ok] Captions generated: captions.json / captions.csv" -ForegroundColor Green
 
@@ -731,13 +788,20 @@ if (-not (Test-Path $ReviewScript)) {
     throw "run-review-ui.ps1 not found at $ReviewScript"
 }
 
+Write-Host ""
+Write-Host "  The review UI will open at http://127.0.0.1:$ReviewPort" -ForegroundColor Green
+Write-Host "  Step through the images, correct any captions, then click End Task." -ForegroundColor DarkGray
+Write-Host "  This window waits here until you do, then exports the .txt files." -ForegroundColor DarkGray
+Write-Host ""
+
 & pwsh -NoProfile -File $ReviewScript `
     -ImageDir $trainDir `
     -Concept $ConceptName `
-    -Port 7861
+    -Port $ReviewPort
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Review UI failed to start (exit code $LASTEXITCODE)"
+    throw ("Review UI exited with code $LASTEXITCODE. Captions are already saved in " +
+        "$trainDir; you can review them later with scripts/run-review-ui.ps1.")
 }
 
 # --- Step 12: Ensure captions are exported to .txt --------------------------

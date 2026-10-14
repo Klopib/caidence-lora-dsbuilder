@@ -381,6 +381,52 @@ Describe 'Get-OllamaVisionModel' {
     }
 }
 
+Describe 'Get-OllamaVisionModelList' {
+
+    It 'returns only the models that can accept images' {
+        # The wizard offers this list as a pick-list, so a text-only model
+        # leaking into it would be selectable and then fail at caption time.
+        Mock -ModuleName Captioners Invoke-RestMethod {
+            @{ models = @(
+                    @{ name = 'qwen3.5:latest' }
+                    @{ name = 'qwen2.5-coder:14b' }
+                    @{ name = 'aravhawk/qwen3.6:27b' }
+                    @{ name = 'llava:7b' }
+                ) }
+        }
+        Mock -ModuleName Captioners Get-OllamaModelCapability {
+            switch -Wildcard ($Model) {
+                'qwen3.5*' { @('completion', 'vision', 'thinking') }
+                'llava*' { @('completion', 'vision') }
+                default { @('completion', 'tools', 'thinking') }
+            }
+        }
+
+        $list = Get-OllamaVisionModelList
+
+        $list.Count | Should -Be 2
+        $list | Should -Contain 'qwen3.5:latest'
+        $list | Should -Contain 'llava:7b'
+        $list | Should -Not -Contain 'aravhawk/qwen3.6:27b'
+        $list | Should -Not -Contain 'qwen2.5-coder:14b'
+    }
+
+    It 'returns an empty list when nothing installed supports vision' {
+        Mock -ModuleName Captioners Invoke-RestMethod {
+            @{ models = @(@{ name = 'qwen2.5-coder:14b' }) }
+        }
+        Mock -ModuleName Captioners Get-OllamaModelCapability { @('completion') }
+
+        @(Get-OllamaVisionModelList).Count | Should -Be 0
+    }
+
+    It 'returns an empty list when no models are installed' {
+        Mock -ModuleName Captioners Invoke-RestMethod { @{ models = @() } }
+
+        @(Get-OllamaVisionModelList).Count | Should -Be 0
+    }
+}
+
 Describe 'Get-OllamaModelCapability' {
 
     It 'returns the capability list Ollama reports' {
