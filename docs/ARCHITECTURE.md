@@ -111,5 +111,6 @@ cloned anywhere.
 
 ## See also
 
+- [../README.md](../README.md) - what the tool does, and setup
 - [WORKFLOW.md](WORKFLOW.md) - the end-to-end flow
 - [DECISIONS.md](DECISIONS.md) - every wizard question and what it changes

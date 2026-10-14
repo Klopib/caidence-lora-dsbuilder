@@ -236,3 +236,11 @@ know:
   you were warned about.
 - A missing captioning backend is an error rather than a prompt, since there is
   nothing to fall back to.
+
+---
+
+## See also
+
+- [../README.md](../README.md) - what the tool does, and setup
+- [WORKFLOW.md](WORKFLOW.md) - the same flow as instructions rather than questions
+- [ARCHITECTURE.md](ARCHITECTURE.md) - how the pieces fit together

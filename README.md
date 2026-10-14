@@ -58,7 +58,8 @@ unsaved state to lose. Click **End Task** when you are done and the pipeline
 continues on its own.
 
 This step is where a dataset goes from automatic to actually good, and it is
-worth the few minutes.
+worth the few minutes. [What to look for](docs/DECISIONS.md#9-review-ui) when
+reviewing.
 
 ### 4. Get a training-ready dataset
 
@@ -72,6 +73,10 @@ trainers expect: each `1.jpg` is read alongside `1.txt`.
 The folder is created as `<concept>/img/<repeats>_<concept>/` with `log/` and
 `model/` beside it, which is the project layout kohya_ss looks for, so the
 output can be pointed at a trainer as-is.
+
+> Step-by-step instructions for this flow are in [docs/WORKFLOW.md](docs/WORKFLOW.md),
+> and every question the wizard asks is explained in
+> [docs/DECISIONS.md](docs/DECISIONS.md).
 
 ## Why the provider interface
 
@@ -94,6 +99,10 @@ rules travel in the prompt, and the model returns text already in the right shap
 
 Florence-2 is kept as a second provider: it is fully offline, has no model-pull
 step once cached, and is a useful fallback when Ollama is not running.
+
+How the two providers sit behind one interface, and why the post-processing is
+asymmetric between them, is covered in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Requirements
 
@@ -324,11 +333,22 @@ review_ui.py                 Gradio review UI
 tests/                       Pester tests, including fixed-bug regressions
 docker/                      Florence-2 API image and compose file
 docs/                        Architecture, workflow and decision guide
+  ARCHITECTURE.md            Components, data flow and design decisions
+  WORKFLOW.md                Step-by-step from photos to trained dataset
+  DECISIONS.md               Every wizard question and what it changes
 datasets/                    Default output root (git-ignored)
 ```
 
 The wizard is the only script at the root, so the entry point is obvious. It
 calls the scripts in `scripts/`, each of which also runs standalone.
+
+## Documentation
+
+| Document | Covers |
+|---|---|
+| [docs/WORKFLOW.md](docs/WORKFLOW.md) | The end-to-end flow, step by step, with the switches that matter at each stage |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | Every question the wizard asks, what each answer changes, and how to choose |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, provider dispatch, data flow, ports and configuration |
 
 ## Development
 

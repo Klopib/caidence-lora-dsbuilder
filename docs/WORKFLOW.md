@@ -117,3 +117,11 @@ answer changes.
   can always see what the model said before post-processing.
 - `run-review-ui.ps1` can reserve its port in a shared registry; set
   `$env:LORA_PORT_REGISTRY` to opt in. It is skipped by default.
+
+---
+
+## See also
+
+- [../README.md](../README.md) - what the tool does, and setup
+- [DECISIONS.md](DECISIONS.md) - every wizard question explained
+- [ARCHITECTURE.md](ARCHITECTURE.md) - how the pieces fit together
