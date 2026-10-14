@@ -18,6 +18,44 @@ source images (read-only)
 Source images are never written to. They are copied into a dataset folder and
 captioned there, so a run can always be repeated from the untouched originals.
 
+## What it does
+
+### 1. Name the concept
+
+![The wizard asking for a concept name](docs/images/wizard-concept.png)
+
+A **concept** is the thing you are teaching the model, and its name becomes the
+**trigger word**: the token you put in a prompt later to summon it. Train on
+`mikey` and you prompt `mikey, standing in a kitchen, soft window light`.
+
+Pick something short and distinctive that the base model does not already
+associate with something else. `mikey` or `rf1` work; `red fox` does not,
+because the model already has strong ideas about both words and will drag them
+in. The trigger must also be spelled identically in every caption, which this
+tool enforces for you. For a fuller treatment, see
+[this guide to choosing a trigger word](https://offlinecreator.com/guide/lora-trigger-word-guide).
+
+### 2. Point it at a folder of photos
+
+![The source folder, with ordinary camera filenames](docs/images/input-folder.png)
+
+Any ordinary folder of images, straight off a phone or camera. Mixed filenames,
+mixed sizes and mixed orientations are all fine. **This folder is only ever read
+from** - nothing is written back into it.
+
+### 3. Get a training-ready dataset
+
+![The output folder, with sequential images each paired with a .txt caption](docs/images/output-folder.webp)
+
+Every image has been copied out, optionally **resized** to a sensible maximum
+edge, **renamed** to a clean sequence, and paired with a **`.txt` file holding
+its caption**. That image/text pairing is the format kohya_ss and most other
+trainers expect: each `1.jpg` is read alongside `1.txt`.
+
+The folder is created as `<concept>/img/<repeats>_<concept>/` with `log/` and
+`model/` beside it, which is the project layout kohya_ss looks for, so the
+output can be pointed at a trainer as-is.
+
 ## Why the provider interface
 
 The original pipeline was built around Florence-2, which cannot take instructions.
