@@ -10,6 +10,31 @@
 name: lora-dataset-builder
 
 services:
+  # Managed captioner: an Ollama instance owned by this project, for machines
+  # with no Ollama install. Behind a profile so it never starts by accident:
+  #   docker compose --profile captioner up -d
+  # scripts/setup-captioner.ps1 drives it and skips it entirely when a working
+  # Ollama is already serving the port.
+  #
+  # Deliberately NOT named 'ollama', and on its own volume, so an existing
+  # Ollama container and its downloaded models are left untouched.
+  captioner:
+    image: ollama/ollama:latest
+    container_name: lora-captioner
+    profiles: ["captioner"]
+    restart: unless-stopped
+    ports:
+      - "${CAPTIONER_PORT:-11434}:11434"
+    volumes:
+      - lora-ollama-models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   florence-2:
     build:
       context: .
@@ -35,3 +60,8 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+volumes:
+  # Models for the managed captioner. Separate from any existing Ollama
+  # volume so this project never writes into one it did not create.
+  lora-ollama-models:

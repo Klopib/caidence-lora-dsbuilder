@@ -66,6 +66,43 @@ Substitute your own concept name throughout.
 Two providers ship with the tool. Neither is required in advance — pick whichever
 suits what you already have.
 
+### No captioner yet? Set one up
+
+If you have no Ollama install, this project can run its own. Docker is the only
+prerequisite, and it is already required for the review UI:
+
+```powershell
+./scripts/setup-captioner.ps1
+```
+
+It starts a captioner owned by this project and downloads a vision model:
+
+| Model | Download | Notes |
+|---|---|---|
+| `qwen3.5:4b` | ~3.5 GB | Good balance of quality and size (recommended) |
+| `qwen3.5:2b` | ~2.9 GB | Smaller and faster, still instruction-following |
+| `qwen3.5:9b` | ~7.0 GB | Best quality, needs more VRAM |
+| `qwen2.5vl:3b` | ~3.2 GB | Alternative family, shorter context |
+| `moondream` | ~1.7 GB | Smallest option, basic captions |
+
+Models are stored in a Docker volume, not in the repo, and downloaded once.
+
+**It will not disturb an Ollama you already run.** If one is already serving the
+port with a vision model, the script uses it and installs nothing. If the port
+is held by something that is not Ollama, it moves to the next free port and
+says so. The managed container is named `lora-captioner` and keeps its own
+volume, so an existing `ollama` container and its models are never touched.
+
+The wizard offers this too: if no captioning backend is reachable, setting one
+up is one of the options rather than a dead end.
+
+To remove it later:
+
+```powershell
+docker rm -f lora-captioner
+docker volume rm lora-dataset-builder_lora-ollama-models
+```
+
 ### Ollama (default)
 
 Any model that reports Ollama's `vision` capability works. You do **not** need a
